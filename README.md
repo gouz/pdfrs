@@ -66,6 +66,69 @@ As query parameters or JSON fields:
 | `REMOTE_ALLOW_PRIVATE` | off | `1`: allow loopback and private addresses (a trusted internal network only) |
 | `MAX_BODY_MB` | `20` | maximum request size |
 
+## Deploy on Google Cloud Run
+
+A stateless HTTP container that starts in milliseconds: a good fit for [Cloud Run](https://cloud.google.com/run). The server listens on `$PORT`, which Cloud Run sets.
+
+**1. Put the image in Artifact Registry.** Cloud Run pulls from Artifact Registry or Docker Hub, not from ghcr.io. Either copy the published image:
+
+```bash
+PROJECT=my-project REGION=europe-west1
+gcloud artifacts repositories create pdfrs --repository-format=docker --location=$REGION
+gcloud auth configure-docker $REGION-docker.pkg.dev
+docker pull --platform linux/amd64 ghcr.io/gouz/pdfrs:0.3.0
+docker tag ghcr.io/gouz/pdfrs:0.3.0 $REGION-docker.pkg.dev/$PROJECT/pdfrs/pdfrs:0.3.0
+docker push $REGION-docker.pkg.dev/$PROJECT/pdfrs/pdfrs:0.3.0
+```
+
+or build it from the sources with Cloud Build (it uses the `Dockerfile`):
+
+```bash
+gcloud builds submit --tag $REGION-docker.pkg.dev/$PROJECT/pdfrs/pdfrs:0.3.0
+```
+
+**2. Deploy.**
+
+```bash
+gcloud run deploy pdfrs \
+  --image=$REGION-docker.pkg.dev/$PROJECT/pdfrs/pdfrs:0.3.0 \
+  --region=$REGION \
+  --cpu=2 --memory=512Mi \
+  --set-env-vars=WORKERS=2 \
+  --concurrency=40 \
+  --min-instances=0 --max-instances=10 \
+  --no-allow-unauthenticated
+```
+
+- **CPU**: rendering is CPU-bound, one render thread per vCPU (`WORKERS` = `--cpu`); each vCPU renders ~1,000 of the benchmark documents per second. Cloud Run scales out by instances, so 1 or 2 vCPUs per instance is enough.
+- **Memory**: a render thread needs ~15 MB plus the documents in flight; 512 MiB leaves room for large documents and images.
+- **Concurrency**: requests beyond `WORKERS` wait in the instance's queue. A lower `--concurrency` makes Cloud Run add instances sooner (lower latency), a higher one packs more requests per instance (lower cost). ~20 per vCPU is a good start.
+- **Request size**: Cloud Run accepts up to 32 MB per request; `MAX_BODY_MB` (20 by default) is checked first.
+- **Cold start**: the server answers `/health` ~50 ms after its container starts (fonts loaded), measured locally; Cloud Run adds the instance start-up on top. `--min-instances=1` keeps one instance warm.
+
+**3. Call it.** Unauthenticated calls are refused (`--no-allow-unauthenticated`): callers need the `roles/run.invoker` role and an identity token.
+
+```bash
+URL=$(gcloud run services describe pdfrs --region=$REGION --format='value(status.url)')
+curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  --data-binary @invoice.html "$URL/?size=A4" -o invoice.pdf
+```
+
+From another Cloud Run service or a Cloud Function, fetch the identity token for the audience `$URL` from the metadata server (the Google client libraries do it: `google.oauth2.id_token.fetch_id_token`, `GoogleAuth.getIdTokenClient`…). Use `--allow-unauthenticated` only for a public demo: anyone could then make the service render (and pay for the CPU).
+
+**Images, stylesheets and fonts from Cloud Storage.** Mount a bucket and point `IMAGES_DIR` (and `FONTS_DIR`) at it:
+
+```bash
+gcloud run services update pdfrs --region=$REGION \
+  --add-volume=name=assets,type=cloud-storage,bucket=my-pdf-assets,readonly=true \
+  --add-volume-mount=volume=assets,mount-path=/assets \
+  --update-env-vars=IMAGES_DIR=/assets,FONTS_DIR=/fonts:/assets/fonts
+```
+
+`<img src="logo.png">` then reads `gs://my-pdf-assets/logo.png`, and the fonts of `gs://my-pdf-assets/fonts/` are loaded at start-up (redeploy to pick up new fonts). The service account of the service needs `roles/storage.objectViewer` on the bucket.
+
+**Remote resources on GCP.** If you enable them (`REMOTE_RESOURCES=1`), keep the guards on: the metadata server (`169.254.169.254`, `metadata.google.internal`) hands out access tokens of the service account, and is precisely what an SSRF goes after. pdfrs refuses link-local and private addresses, so it is not reachable from a document; never set `REMOTE_ALLOW_PRIVATE=1` on Cloud Run. Prefer `REMOTE_HOSTS` with the hosts your templates actually use. Through a VPC connector with all traffic routed to the VPC, remote resources need Cloud NAT to reach the internet.
+
 ## Command line
 
 The same binary converts a file:
