@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 const dir = new URL('.', import.meta.url).pathname;
 const NAMES: Record<string, string> = {
-  rs: 'pdfrs, tous les cœurs', jsN: 'pdfjs Node × cœurs', js1: 'pdfjs Node × 1', rs1: 'pdfrs, 1 cœur', js1c: 'pdfjs Node × 1, 1 cœur',
+  rs: 'pdfrs, all cores', jsN: 'pdfjs Node × cores', js1: 'pdfjs Node × 1', rs1: 'pdfrs, 1 core', js1c: 'pdfjs Node × 1, 1 core',
 };
 type Row = { label: string; vus: number; reqS: number; p95: number; mem: number };
 const rows: Row[] = readFileSync(dir + 'results.csv', 'utf8').trim().split('\n').slice(1).map((l) => l.split(','))
@@ -34,7 +34,7 @@ function chart(file: string, title: string, key: 'reqS' | 'mem' | 'p95', unit: s
   // end-of-line labels: sorted by height and pushed apart so they never overlap
   const ends = series.map((s) => ({ s, ly: y(s.pts.at(-1)!.val) + 4 })).sort((a, b) => a.ly - b.ly);
   ends.forEach((e, i) => { if (i) e.ly = Math.max(e.ly, ends[i - 1].ly + 15); });
-  const fmt = (n: number) => n.toLocaleString('fr-FR');
+  const fmt = (n: number) => n.toLocaleString('en-US');
 
   writeFileSync(dir + file, `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" font-family="-apple-system, Segoe UI, Helvetica, sans-serif" font-size="12">
 <style>
@@ -50,14 +50,14 @@ function chart(file: string, title: string, key: 'reqS' | 'mem' | 'p95', unit: s
 ${series.map((s, i) => `<g transform="translate(${L + (i % 3) * 190},${42 + Math.floor(i / 3) * 18})"><line class="${s.cls}" x1="0" x2="14" y1="0" y2="0" stroke-width="2"/><circle class="${s.cls}" cx="7" r="4"/><text class="muted" x="20" y="4">${s.label}</text></g>`).join('')}
 ${ticks.map((t) => `<line class="${t === ticks[0] ? 'axis' : 'grid'}" x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}"/><text class="muted" x="${L - 8}" y="${y(t) + 4}" text-anchor="end">${fmt(t)}</text>`).join('\n')}
 ${vus.map((v) => `<text class="muted" x="${x(v)}" y="${H - B + 18}" text-anchor="middle">${v}</text>`).join('')}
-<text class="muted" x="${(L + W - R) / 2}" y="${H - 8}" text-anchor="middle">utilisateurs virtuels k6 (VUs)${log ? ' — échelle logarithmique' : ''}</text>
+<text class="muted" x="${(L + W - R) / 2}" y="${H - 8}" text-anchor="middle">k6 virtual users (VUs)${log ? ' — log scale' : ''}</text>
 ${series.map((s) => `<polyline class="${s.cls}" style="fill:none" stroke-width="2" stroke-linejoin="round" points="${s.pts.map((p) => `${x(p.v)},${y(p.val)}`).join(' ')}"/>
-${s.pts.map((p) => `<circle class="${s.cls}" cx="${x(p.v)}" cy="${y(p.val)}" r="4"><title>${s.label}, ${p.v} VUs : ${fmt(p.val)} ${unit}</title></circle>`).join('')}`).join('\n')}
+${s.pts.map((p) => `<circle class="${s.cls}" cx="${x(p.v)}" cy="${y(p.val)}" r="4"><title>${s.label}, ${p.v} VUs: ${fmt(p.val)} ${unit}</title></circle>`).join('')}`).join('\n')}
 ${ends.map(({ s, ly }) => `<text class="ink" x="${W - R + 10}" y="${ly}">${s.label} · ${fmt(s.pts.at(-1)!.val)} ${unit}</text>`).join('\n')}
 </svg>
 `);
 }
 
-chart('chart.svg', "Débit (PDF/s) selon le nombre d'utilisateurs simultanés", 'reqS', 'PDF/s', true);
-chart('memory.svg', "Mémoire max (Mo) selon le nombre d'utilisateurs simultanés", 'mem', 'Mo', false);
-chart('latency.svg', "Latence p95 (ms) selon le nombre d'utilisateurs simultanés", 'p95', 'ms', true);
+chart('chart.svg', 'Throughput (PDF/s) by number of concurrent users', 'reqS', 'PDF/s', true);
+chart('memory.svg', 'Peak memory (MB) by number of concurrent users', 'mem', 'MB', false);
+chart('latency.svg', 'p95 latency (ms) by number of concurrent users', 'p95', 'ms', true);
