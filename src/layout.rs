@@ -83,6 +83,15 @@ pub struct TextLeaf {
     pub layout: parley::Layout<Brush>,
     pub text: String,
     pub align: parley::Alignment,
+    /// `::first-line` of the block: the pieces and container to rebuild the text from, the declarations
+    first_line: Option<FirstLine>,
+}
+
+struct FirstLine {
+    pieces: Vec<Piece>,
+    container: Rc<Style>,
+    decls: Rc<Vec<Decl>>,
+    rem: f32,
 }
 
 #[derive(Clone)]
@@ -198,6 +207,7 @@ pub struct Tree {
     pub text_fills: Vec<NodeId>,
 }
 
+#[derive(Clone)]
 enum Piece {
     Text(String, Rc<Style>, Brush),
     Break(Rc<Style>, Brush),
@@ -234,6 +244,8 @@ struct Builder<'a> {
     cells: std::collections::HashSet<NodeId>,
     /// `::first-letter` style waiting for the first letter of the current block
     first_letter: Option<Rc<Style>>,
+    /// `::first-line` declarations waiting for the first text of the current block
+    first_line: Option<Rc<Vec<Decl>>>,
     /// `background-clip: text` elements (their node, once built), and the one painting the current text
     text_fills: Vec<Option<NodeId>>,
     text_fill: u32,
@@ -455,6 +467,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             footers: HashMap::new(),
             cells: Default::default(),
             first_letter: None,
+            first_line: None,
             text_fills: Vec::new(),
             text_fill: 0,
             bg_images: HashMap::new(),
@@ -551,6 +564,106 @@ fn text_style(s: &Style, brush: Brush) -> TextStyle<'static, 'static, Brush> {
         vertical_align: if matches!(s.vertical_align, VAlign::Sub | VAlign::Super | VAlign::Length(_)) { valign(s.vertical_align) } else { parley::VerticalAlign::BASELINE },
         ..TextStyle::default()
     }
+}
+
+/// A parley layout for a group of inline pieces in `container` (inline boxes sized 0 until laid out).
+fn text_layout(fcx: &mut FontContext, lcx: &mut LayoutContext<Brush>, pieces: &[Piece], container: &Style) -> (parley::Layout<Brush>, String) {
+    let root = text_style(container, brush_of(container));
+    let mut b = lcx.tree_builder(fcx, 1.0, true, &root);
+    if container.rtl {
+        b.set_base_direction(parley::BaseDirection::Rtl);
+    }
+    for p in pieces {
+        match p {
+            Piece::Text(t, s, brush) => {
+                b.push_style_span(text_style(s, brush.clone()));
+                b.push_text(t);
+                b.pop_style_span();
+            }
+            Piece::Break(s, brush) => {
+                b.push_style_span(text_style(s, brush.clone()));
+                b.push_style_modification_span(&[StyleProperty::WhiteSpaceCollapse(parley::WhiteSpaceCollapse::Preserve)]);
+                b.push_text("\n");
+                b.pop_style_span();
+                b.pop_style_span();
+            }
+            Piece::Box(node, s) => {
+                // sized before layout (Tree::size_inline_boxes)
+                b.push_inline_box(parley::InlineBox {
+                    id: u64::from(*node),
+                    kind: parley::InlineBoxKind::InFlow,
+                    index: 0,
+                    width: 0.0,
+                    height: 0.0,
+                    baseline: None,
+                    vertical_align: valign(s.vertical_align),
+                });
+            }
+        }
+    }
+    b.build()
+}
+
+/// Rebuild a leaf's text with its first `n` visible characters in its ::first-line style (and a line
+/// break after them if `brk`), keeping the inline boxes' sizes; broken at width `w`.
+fn restyle_first_line(t: &mut TextLeaf, n: usize, brk: bool, w: f32, fcx: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
+    let Some(fl) = &t.first_line else { return };
+    let pieces = first_line_pieces(&fl.pieces, n, brk, &fl.decls, fl.rem);
+    let (mut layout, text) = text_layout(fcx, lcx, &pieces, &fl.container);
+    let sizes: Vec<_> = t.layout.inline_boxes().map(|b| (b.id, b.width, b.height, b.baseline)).collect();
+    for ib in layout.inline_boxes_mut() {
+        if let Some(sz) = sizes.iter().find(|s| s.0 == ib.id) {
+            (ib.width, ib.height, ib.baseline) = (sz.1, sz.2, sz.3);
+        }
+    }
+    layout.break_all_lines(Some(w + 0.01));
+    (t.layout, t.text) = (layout, text);
+}
+
+/// The pieces with their first `n` non-whitespace characters in the ::first-line style.
+fn first_line_pieces(pieces: &[Piece], n: usize, brk: bool, decls: &[Decl], rem: f32) -> Vec<Piece> {
+    let refs: Vec<&Decl> = decls.iter().collect();
+    let restyle = |s: &Rc<Style>, b: &Brush| {
+        let fl = Style::compute(s, &refs, rem);
+        let brush = Brush { color: fl.color, background: fl.background.or(b.background), ..b.clone() };
+        (Rc::new(fl), brush)
+    };
+    let mut left = n;
+    let mut out = Vec::with_capacity(pieces.len() + 1);
+    for p in pieces {
+        match p {
+            Piece::Text(t, s, b) if left > 0 => {
+                // split after `left` visible characters (and the whitespace right after them)
+                let mut cut = t.len();
+                let mut count = 0;
+                for (i, c) in t.char_indices() {
+                    if count == left && !c.is_whitespace() {
+                        cut = i;
+                        break;
+                    }
+                    if !c.is_whitespace() {
+                        count += 1;
+                    }
+                }
+                left -= count.min(left);
+                let (fs, fb) = restyle(s, b);
+                let styled = &t[..cut];
+                out.push(Piece::Text(apply_transform(styled, fs.transform), fs.clone(), fb.clone()));
+                if brk && left == 0 {
+                    out.push(Piece::Break(fs, fb));
+                }
+                if cut < t.len() {
+                    out.push(Piece::Text(t[cut..].to_string(), s.clone(), b.clone()));
+                }
+            }
+            Piece::Break(s, b) if left > 0 => {
+                let (fs, fb) = restyle(s, b);
+                out.push(Piece::Break(fs, fb));
+            }
+            p => out.push(p.clone()),
+        }
+    }
+    out
 }
 
 fn valign(v: VAlign) -> parley::VerticalAlign {
@@ -764,6 +877,29 @@ impl Builder<'_> {
         }
     }
 
+    /// `::first-letter` / `::first-line` of a block: armed for the text that follows (in this box or
+    /// its first child boxes). Returns which ones this block set.
+    #[inline(never)]
+    fn first_pseudos(&mut self, el: ElementRef, s: &Style) -> (bool, bool) {
+        if !self.sheet.has_pseudo {
+            return (false, false);
+        }
+        let mut owns = (false, false);
+        let decls = css::matched(el, Some(Pseudo::FirstLine), &UA, &self.sheet.rules, &[]);
+        if !decls.is_empty() {
+            self.first_line = Some(Rc::new(decls.into_iter().cloned().collect()));
+            owns.1 = true;
+        }
+        let decls = css::matched(el, Some(Pseudo::FirstLetter), &UA, &self.sheet.rules, &[]);
+        if !decls.is_empty() {
+            let mut fl = Style::compute(s, &decls, self.rem);
+            fl.display = Display::Inline;
+            self.first_letter = Some(Rc::new(fl));
+            owns.0 = true;
+        }
+        owns
+    }
+
     /// `::before` / `::after` content of `el`: inline text in the current group, or its own box.
     #[inline(never)]
     fn pseudo(&mut self, el: ElementRef, s: &Rc<Style>, which: Pseudo, brush: &Brush, ctx: &mut Ctx, container: &Rc<Style>) {
@@ -861,23 +997,16 @@ impl Builder<'_> {
             self.text_fill = i as u32 + 1;
         }
         let brush = Brush { text_fill: self.text_fill, ..brush_of(&s) };
-        // ::first-letter: styles the first letter of the text that follows (in this box or its first child boxes)
-        let mut owns_first_letter = false;
-        if self.sheet.has_pseudo {
-            let decls = css::matched(el, Some(Pseudo::FirstLetter), &UA, &self.sheet.rules, &[]);
-            if !decls.is_empty() {
-                let mut fl = Style::compute(&s, &decls, self.rem);
-                fl.display = Display::Inline;
-                self.first_letter = Some(Rc::new(fl));
-                owns_first_letter = true;
-            }
-        }
+        let (owns_first_letter, owns_first_line) = self.first_pseudos(el, &s);
         self.pseudo(el, &s, Pseudo::Before, &brush, &mut ctx, &s);
         self.walk(*el, &s, brush.clone(), &mut ctx, &s);
         self.pseudo(el, &s, Pseudo::After, &brush, &mut ctx, &s);
         self.flush(&mut ctx, &s);
         if owns_first_letter {
             self.first_letter = None;
+        }
+        if owns_first_line {
+            self.first_line = None;
         }
         self.text_fill = outer_fill;
         let mut ts = to_taffy(&s);
@@ -1094,40 +1223,7 @@ impl Builder<'_> {
         if !visible {
             return None;
         }
-        let root = text_style(container, brush_of(container));
-        let mut b = self.lcx.tree_builder(self.fcx, 1.0, true, &root);
-        if container.rtl {
-            b.set_base_direction(parley::BaseDirection::Rtl);
-        }
-        for p in &group {
-            match p {
-                Piece::Text(t, s, brush) => {
-                    b.push_style_span(text_style(s, brush.clone()));
-                    b.push_text(t);
-                    b.pop_style_span();
-                }
-                Piece::Break(s, brush) => {
-                    b.push_style_span(text_style(s, brush.clone()));
-                    b.push_style_modification_span(&[StyleProperty::WhiteSpaceCollapse(parley::WhiteSpaceCollapse::Preserve)]);
-                    b.push_text("\n");
-                    b.pop_style_span();
-                    b.pop_style_span();
-                }
-                Piece::Box(node, s) => {
-                    // sized before layout (Tree::size_inline_boxes)
-                    b.push_inline_box(parley::InlineBox {
-                        id: u64::from(*node),
-                        kind: parley::InlineBoxKind::InFlow,
-                        index: 0,
-                        width: 0.0,
-                        height: 0.0,
-                        baseline: None,
-                        vertical_align: valign(s.vertical_align),
-                    });
-                }
-            }
-        }
-        let (layout, text) = b.build();
+        let (layout, text) = text_layout(self.fcx, self.lcx, &group, container);
         let align = match container.text_align {
             TextAlign::Start => parley::Alignment::Start,
             TextAlign::Left => parley::Alignment::Left,
@@ -1135,7 +1231,8 @@ impl Builder<'_> {
             TextAlign::Center => parley::Alignment::Center,
             TextAlign::Justify => parley::Alignment::Justify,
         };
-        let leaf = self.taffy.new_leaf_with_context(taffy::Style::default(), Leaf::Text(TextLeaf { layout, text, align })).ok()?;
+        let first_line = self.first_line.take().map(|decls| FirstLine { pieces: group.clone(), container: container.clone(), decls, rem: self.rem });
+        let leaf = self.taffy.new_leaf_with_context(taffy::Style::default(), Leaf::Text(TextLeaf { layout, text, align, first_line })).ok()?;
         for p in &group {
             if let Piece::Box(node, _) = p {
                 self.inline.push((*node, leaf));
@@ -1420,6 +1517,63 @@ impl Tree {
     }
 
     /// Lay the tree out and set every text leaf's final line breaks and alignment.
+    /// Lay out, then style the `::first-line` of the blocks that have one (needs fonts: that text
+    /// is shaped again) and lay out once more if it changed.
+    pub fn compute_with_fonts(&mut self, width: f32, fcx: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
+        self.compute(width);
+        let leaves: Vec<NodeId> = self.taffy_leaves().into_iter().filter(|n| matches!(self.taffy.get_node_context(*n), Some(Leaf::Text(t)) if t.first_line.is_some())).collect();
+        if leaves.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for leaf in leaves {
+            let w = self.taffy.layout(leaf).map(|l| l.content_box_width()).unwrap_or(0.0);
+            let Some(Leaf::Text(t)) = self.taffy.get_node_context_mut(leaf) else { continue };
+            // the number of visible characters in the ::first-line style: the most that still fit on the
+            // first line once styled. Too many styled: shrink; room left for more: try styling them too.
+            let first_count = |t: &TextLeaf| t.layout.lines().next().map_or(0, |l| t.text[l.text_range()].chars().filter(|c| !c.is_whitespace()).count());
+            let mut styled = first_count(t);
+            let mut too_many = usize::MAX;
+            let mut forced_break = false;
+            for _ in 0..10 {
+                restyle_first_line(t, styled, false, w, fcx, lcx);
+                let n = first_count(t);
+                if n < styled {
+                    too_many = too_many.min(styled);
+                    styled = n;
+                } else if n > styled && n < too_many {
+                    styled = n;
+                } else {
+                    // fits; unstyled text left on the first line would not fit styled: end the line there
+                    forced_break = n > styled;
+                    break;
+                }
+            }
+            if forced_break {
+                restyle_first_line(t, styled, true, w, fcx, lcx);
+            }
+            changed = true;
+            let _ = self.taffy.mark_dirty(leaf);
+        }
+        if changed {
+            self.compute(width);
+        }
+    }
+
+    fn taffy_leaves(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root];
+        stack.extend(self.inline.iter().map(|i| i.0));
+        while let Some(n) = stack.pop() {
+            let children = self.taffy.children(n).unwrap_or_default();
+            if children.is_empty() {
+                out.push(n);
+            }
+            stack.extend(children);
+        }
+        out
+    }
+
     pub fn compute(&mut self, width: f32) {
         let space = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
         self.size_inline_boxes();

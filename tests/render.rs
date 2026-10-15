@@ -527,3 +527,20 @@ fn left_right_pages_and_all_margin_boxes() {
     let (min, max) = xs.iter().fold((f32::MAX, f32::MIN), |a, x| (a.0.min(*x), a.1.max(*x)));
     assert!((min - 20.0).abs() < 1.0 && (max - 60.0).abs() < 1.0, "x from {min} to {max}");
 }
+
+#[test]
+fn first_line() {
+    if !has_pdftotext() {
+        return;
+    }
+    let words_in: Vec<String> = (0..60).map(|i| format!("mot{i}")).collect();
+    let html = format!("<style>p::first-line {{ text-transform: uppercase; font-weight: bold; font-size: 14px }}</style><p>{}</p>", words_in.join(" "));
+    let text = text_of(&pdf(&html, &Options::default()));
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(lines.len() >= 3);
+    assert!(lines[0].split_whitespace().all(|w| w.starts_with("MOT")), "first line: {}", lines[0]);
+    assert!(lines[1].split_whitespace().all(|w| w.starts_with("mot")), "second line: {}", lines[1]);
+    // every word once
+    let all: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
+    assert_eq!(all, words_in);
+}

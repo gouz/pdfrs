@@ -91,7 +91,7 @@ fn band(html: &str, page: usize, pages: usize, o: &Options, width: f32, media: &
     let mut faces = faces.to_vec();
     faces.extend(layout::load_font_faces(&sheet.font_faces, &o.images));
     let mut t = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, width, &mut lcx.borrow_mut()));
-    t.compute(width);
+    compute(&mut t, width, &faces);
     t
 }
 
@@ -266,6 +266,11 @@ fn margin_bands(o: &Options, pages: &[PageRule], kind: PageKind, (pw, ph): (f32,
     out
 }
 
+/// Lay a tree out (with the fonts, for its `::first-line`).
+fn compute(tree: &mut layout::Tree, width: f32, faces: &[fonts::DocFace]) {
+    LCX.with(|lcx| fonts::with_doc_font_cx(faces, |fcx| tree.compute_with_fonts(width, fcx, &mut lcx.borrow_mut())));
+}
+
 /// Forgets the document's @font-face fonts, however the render ends.
 struct DocGuard;
 impl Drop for DocGuard {
@@ -292,7 +297,7 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     let faces = layout::load_font_faces(&sheet.font_faces, &o.images);
 
     let mut tree = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, cw, &mut lcx.borrow_mut()));
-    tree.compute(cw);
+    compute(&mut tree, cw, &faces);
     // the root's background goes to the whole page (the canvas), its borders stay on the root box
     let canvas = tree.deco.get_mut(&tree.root).and_then(|d| {
         let c = layout::Deco { background: d.background.take(), layers: std::mem::take(&mut d.layers), color_clip: d.color_clip, ..Default::default() };

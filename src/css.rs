@@ -16,6 +16,7 @@ pub enum Pseudo {
     After,
     Marker,
     FirstLetter,
+    FirstLine,
 }
 
 /// An `@page` rule: page properties, and its margin boxes (`@top-center { content: ... }`).
@@ -161,6 +162,8 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
                 (&sel[..b.len()], Some(Pseudo::Marker))
             } else if let Some(b) = lower.strip_suffix("::first-letter").or(lower.strip_suffix(":first-letter")) {
                 (&sel[..b.len()], Some(Pseudo::FirstLetter))
+            } else if let Some(b) = lower.strip_suffix("::first-line").or(lower.strip_suffix(":first-line")) {
+                (&sel[..b.len()], Some(Pseudo::FirstLine))
             } else if lower.contains("::") {
                 continue; // ::marker, ::first-line, ::placeholder...: not generated
             } else {
