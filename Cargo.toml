@@ -1,6 +1,6 @@
 [package]
 name = "pdfrs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "HTML/CSS to PDF, without a browser: a Rust port of @gouz/pdfjs"
 license = "MIT"
