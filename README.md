@@ -111,7 +111,8 @@ As in pdfjs, **1 px = 1 pt**.
 - Full **flexbox**: `flex-direction`, `flex-wrap`, `flex` / `flex-grow` / `flex-shrink` / `flex-basis`, `justify-content`, `align-items`, `align-self`, `align-content`, `gap`, `order`.
 - **Grid**: `grid-template-columns` / `-rows` (`fr`, `repeat()`, `minmax()`, `auto`…), `grid-column` / `grid-row`, `grid-auto-flow`, `gap`, `justify-items`, `place-items`…
 - **Boxes**: `width` / `height` (+ `min-` / `max-`), `box-sizing`, `margin`, `padding`, `border` (width, `solid` / `dashed` / `dotted`, color per side), `border-radius`, `background-color`, `opacity`, `overflow: hidden`, `aspect-ratio`.
-- **Backgrounds**: colors and gradients, `linear-gradient()` (angles, `to right`, `to top left`…), `radial-gradient()` (`circle` / `ellipse`, `at` position), `repeating-` variants, color stops with positions; in `background` or `background-image` (first gradient layer).
+- **Backgrounds**: `background-image: url()` (same policy as `<img>`: `data:` or `IMAGES_DIR`) with `background-size` (`cover`, `contain`, lengths, `%`), `background-position` (keywords, lengths, `%`, `right 10px bottom 5px`), `background-repeat` (`repeat`, `no-repeat`, `repeat-x` / `-y`), all in the `background` shorthand too; colors and gradients, `linear-gradient()` (angles, `to right`, `to top left`…), `radial-gradient()` (`circle` / `ellipse`, `at` position), `repeating-` variants, color stops with positions; in `background` or `background-image` (first gradient layer).
+- **Shadows**: `box-shadow` with offsets, blur, spread, color and several shadows; a blurred shadow is drawn as a bitmap under the box (~2 px per pt), an unblurred one as a crisp vector shape. `inset` shadows are ignored.
 - **Transforms**: `transform` (`translate`, `scale`, `rotate`, `skew`, `matrix`, their `X` / `Y` forms, combined) and `transform-origin`. As in CSS, the layout is unchanged; links in a transformed box keep their untransformed area.
 - **Generated content**: `::before` / `::after` (and `:before` / `:after`) with `content` strings, escapes (`"\201C"`), `attr()`, `open-quote` / `close-quote`, any style; `display: block` makes a box. `<q>` gets quotes.
 - **Values**: custom properties `--name` and `var(--name, fallback)` (inherited, nestable), `calc()` (`+ - * /`, parentheses, any mix of units, `calc(100% - 20px)` included), `min()` / `max()` / `clamp()` on absolute lengths.
@@ -120,11 +121,11 @@ As in pdfjs, **1 px = 1 pt**.
 - **Inline boxes**: `inline-block` (and `inline-flex` / `-grid` / `-table`) and images sit in the line of text like in a browser: padding, borders and backgrounds are kept, the box shrinks to fit the line when it is too wide, and `vertical-align` (`baseline`, `middle`, `top`, `bottom`, `text-top`, `text-bottom`) places it; `text-align` centers an image. Direct children of a flex or grid box are items instead, as in CSS.
 - **Text**: `vertical-align: sub` / `super` (`<sub>`, `<sup>`), `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
 - **Units**: `px`, `pt`, `em`, `rem`, `%`, `mm`, `cm`, `in`, `pc`. Colors: names, `#hex`, `rgb()`, `hsl()`…
-- **Pagination**: automatic page breaks between lines of text (never through a line or an image), `page-break-before` / `-after: always` (or `break-before: page`), `page-break-inside: avoid`.
+- **Pagination**: automatic page breaks between lines of text (never through a line, an image or a table cell that fits on a page), `page-break-before` / `-after: always` (or `break-before: page`), `page-break-inside: avoid`. A table that continues on the next page repeats its `<thead>` at the top.
 - **HTML**: tables (grid with `colspan` / `rowspan`, `border-collapse`, `border-spacing`, `vertical-align`), lists (`disc`, `circle`, `square`, `decimal`, `lower-alpha`, `upper-roman`…, `<ol start>`, `<li value>`), clickable links (`http(s):`, `mailto:`, `tel:`), `<br>`, `<pre>`, `<svg>`, browser default styles (`h1`…`h6`, `b`, `i`, `code`…), `align` / `bgcolor` attributes.
 - `<style>` with all CSS selectors (`>`, `+`, `~`, `:first-child`, `:nth-child()`, `[attr]`, `:not()`…), specificity and `!important`.
 
-**Not supported**: `background-image: url()`, `box-shadow`, `counter()` / `counter-increment` (empty in `content`), `::marker` / `::first-line` / `::first-letter`, `@page :first` / named pages / page-margin boxes (use the `header` / `footer` options), WOFF / WOFF2 fonts, external `<link>` stylesheets, text wrapping around a `float`, `vertical-align` with a length or a percentage, repeating `<thead>` on every page.
+**Not supported**: `inset` box shadows, several `background-image` layers (the first `url()` and the first gradient are drawn), `background-attachment`, `background-origin` / `-clip` (images are positioned in the padding box and clipped to the border box), repeating `<tfoot>`, `counter()` / `counter-increment` (empty in `content`), `::marker` / `::first-line` / `::first-letter`, `@page :first` / named pages / page-margin boxes (use the `header` / `footer` options), WOFF / WOFF2 fonts, external `<link>` stylesheets, text wrapping around a `float`, `vertical-align` with a length or a percentage.
 
 **Differences from pdfjs**:
 - Vertical margins collapse like in a browser (react-pdf adds them up): paragraphs are slightly tighter.
@@ -139,8 +140,9 @@ As in pdfjs, **1 px = 1 pt**.
 | [`demo/example.html`](demo/example.html) | [`demo/example.pdf`](demo/example.pdf) | simple invoice |
 | [`demo/flex.html`](demo/flex.html) | [`demo/flex.pdf`](demo/flex.pdf) | flexbox |
 | [`demo/images.html`](demo/images.html) | [`demo/images.pdf`](demo/images.pdf) | images and the image policy |
-| [`demo/report.html`](demo/report.html) | [`demo/report.pdf`](demo/report.pdf) | 3 pages: grid, lists, SVG, `<pre>`, long table, forced page break (rendered with a header and a footer) |
+| [`demo/report.html`](demo/report.html) | [`demo/report.pdf`](demo/report.pdf) | 3 pages: grid, lists, SVG, `<pre>`, long table with a repeated header, forced page break (rendered with a header and a footer) |
 | [`demo/inline.html`](demo/inline.html) | [`demo/inline.pdf`](demo/inline.pdf) | badges, buttons, cards and images in the line of text, shrink-to-fit, `vertical-align`, `<sub>` / `<sup>` |
+| [`demo/backgrounds.html`](demo/backgrounds.html) | [`demo/backgrounds.pdf`](demo/backgrounds.pdf) | `box-shadow`, `background-image` (tiles, `cover`, `contain`, position), a 3-page table repeating its `<thead>` |
 | [`demo/features.html`](demo/features.html) | [`demo/features.pdf`](demo/features.pdf) | gradients, transforms, `calc()`, `var()`, `::before` / `::after`, `@media`, `@page`, right-to-left |
 
 ## Performance

@@ -3,7 +3,7 @@
 use crate::css::{self, Decl, Media, Pseudo, Rule, Sheet};
 use crate::fonts;
 use crate::images::{self, ImagePolicy};
-use crate::style::{self, BorderStyle, Display, Gradient, Len, ObjectFit, Rgba, Style, TextAlign, Transform, VAlign, WhiteSpace};
+use crate::style::{self, BgSize, BorderStyle, Display, Gradient, Len, ObjectFit, Rgba, Shadow, Style, TextAlign, Transform, VAlign, WhiteSpace};
 use ego_tree::NodeRef;
 use parley::{FontContext, LayoutContext, StyleProperty, TextStyle};
 use scraper::{ElementRef, Html, Node};
@@ -83,6 +83,7 @@ pub struct TextLeaf {
     pub align: parley::Alignment,
 }
 
+#[derive(Clone)]
 pub enum ImageKind {
     Raster(krilla::image::Image),
     Svg(Arc<usvg::Tree>),
@@ -100,6 +101,21 @@ pub enum Leaf {
     Image(ImageLeaf),
 }
 
+/// A `background-image: url()` layer, decoded.
+pub struct BgLayer {
+    pub kind: ImageKind,
+    pub natural: (f32, f32),
+    pub size: BgSize,
+    pub position: (Len, Len),
+    pub repeat: (bool, bool),
+}
+
+impl std::fmt::Debug for BgLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BgLayer({:?}, {:?})", self.natural, self.size)
+    }
+}
+
 /// What is drawn for an element box besides its children.
 #[derive(Clone, Debug, Default)]
 pub struct Deco {
@@ -114,6 +130,8 @@ pub struct Deco {
     pub break_after: bool,
     pub avoid_break_inside: bool,
     pub gradient: Option<Rc<Gradient>>,
+    pub bg_image: Option<Rc<BgLayer>>,
+    pub shadows: Option<Rc<Vec<Shadow>>>,
     /// `transform`, `transform-origin`, font size (for em units)
     pub transform: Option<(Rc<str>, Option<Rc<str>>, f32)>,
 }
@@ -123,6 +141,8 @@ impl Deco {
     fn needed(&self) -> bool {
         self.background.is_some()
             || self.gradient.is_some()
+            || self.bg_image.is_some()
+            || self.shadows.is_some()
             || self.border_width.iter().any(|w| *w > 0.0)
             || self.opacity < 1.0
             || self.clip
@@ -156,6 +176,10 @@ pub struct Tree {
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
     /// (inline box root, text leaf holding it), inner boxes first
     inline: Vec<(NodeId, NodeId)>,
+    /// table -> its <thead> cells, repeated at the top of the pages the table continues on
+    pub headers: HashMap<NodeId, Vec<NodeId>>,
+    /// table cells: not split across pages when they fit on one
+    pub cells: std::collections::HashSet<NodeId>,
 }
 
 enum Piece {
@@ -189,6 +213,10 @@ struct Builder<'a> {
     walk_depth: usize,
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
     inline: Vec<(NodeId, NodeId)>,
+    headers: HashMap<NodeId, Vec<NodeId>>,
+    cells: std::collections::HashSet<NodeId>,
+    /// decoded background images by url (the same image is often repeated on many boxes)
+    bg_images: HashMap<Rc<str>, Option<(ImageKind, (f32, f32))>>,
 }
 
 /// Deeper boxes are flattened into their ancestor; deeper inline content is dropped.
@@ -273,6 +301,9 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             walk_depth: 0,
             calc: Vec::new(),
             inline: Vec::new(),
+            headers: HashMap::new(),
+            cells: Default::default(),
+            bg_images: HashMap::new(),
         };
         b.taffy.disable_rounding();
         let base = Rc::new(Style::root(font, font_size));
@@ -288,7 +319,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.background = body_style.background.or(html_style.background);
         body_style.gradient = body_style.gradient.clone().or(html_style.gradient.clone());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, cells: b.cells }
     })
 }
 
@@ -493,6 +524,21 @@ fn deco_of(s: &Style) -> Deco {
         avoid_break_inside: s.break_inside_avoid,
         gradient: s.gradient.clone(),
         transform: s.transform_fn.clone().map(|t| (t, s.transform_origin.clone(), s.font_size)),
+        bg_image: None,
+        shadows: s.shadows.clone(),
+    }
+}
+
+/// Decode image bytes: SVG, or PNG / JPEG / GIF / WebP. With the natural size in pt (1 px = 1 pt).
+fn decode(data: Vec<u8>) -> Option<(ImageKind, (f32, f32))> {
+    if images::is_svg(&data) {
+        let tree = svg_tree(&String::from_utf8_lossy(&data))?;
+        let size = (tree.size().width(), tree.size().height());
+        Some((ImageKind::Svg(Arc::new(tree)), size))
+    } else {
+        let image = raster(data)?;
+        let (w, h) = image.size();
+        Some((ImageKind::Raster(image), (w as f32, h as f32)))
     }
 }
 
@@ -542,7 +588,22 @@ impl Builder<'_> {
 
     /// Decoration and calc() fix-ups of a new element node.
     fn finish_node(&mut self, node: NodeId, s: &Style) {
-        let d = deco_of(s);
+        let mut d = deco_of(s);
+        if let Some(url) = &s.bg_image {
+            let policy = self.policy;
+            let decoded = self
+                .bg_images
+                .entry(url.clone())
+                .or_insert_with(|| {
+                    let img = images::load(url, policy).and_then(decode);
+                    if img.is_none() {
+                        eprintln!("pdfrs: background image blocked or not found: {}", url.chars().take(80).collect::<String>());
+                    }
+                    img
+                })
+                .clone();
+            d.bg_image = decoded.map(|(kind, natural)| Rc::new(BgLayer { kind, natural, size: s.bg_size, position: s.bg_position, repeat: s.bg_repeat }));
+        }
         if d.needed() {
             self.deco.insert(node, d);
         }
@@ -834,15 +895,7 @@ impl Builder<'_> {
                 eprintln!("pdfrs: image blocked or not found: {}", src.chars().take(80).collect::<String>());
                 return None;
             };
-            if images::is_svg(&data) {
-                let tree = svg_tree(&String::from_utf8_lossy(&data))?;
-                let size = (tree.size().width(), tree.size().height());
-                (ImageKind::Svg(Arc::new(tree)), size)
-            } else {
-                let image = raster(data)?;
-                let (w, h) = image.size();
-                (ImageKind::Raster(image), (w as f32, h as f32))
-            }
+            decode(data)?
         };
         let mut s = (**s).clone();
         // width / height attributes, CSS wins (same as browsers)
@@ -872,7 +925,8 @@ impl Builder<'_> {
     fn build_table(&mut self, el: ElementRef, s: Rc<Style>) -> Option<NodeId> {
         let mut rows: Vec<(ElementRef, Rc<Style>)> = Vec::new();
         let mut captions = Vec::new();
-        self.table_rows(el, &s, &mut rows, &mut captions);
+        let header_rows = self.table_rows(el, &s, &mut rows, &mut captions);
+        let mut header_cells = Vec::new();
 
         let mut children = Vec::new();
         let mut taken: Vec<Vec<bool>> = Vec::new();
@@ -924,6 +978,10 @@ impl Builder<'_> {
                 st.grid_column = taffy::Line { start: line((c + 1) as i16), end: span(colspan as u16) };
                 let _ = self.taffy.set_style(n, st);
                 children.push(n);
+                self.cells.insert(n);
+                if r < header_rows {
+                    header_cells.push(n);
+                }
             }
         }
         for cap in captions {
@@ -944,10 +1002,14 @@ impl Builder<'_> {
         }
         let node = self.taffy.new_with_children(ts, &children).ok()?;
         self.finish_node(node, &s);
+        if !header_cells.is_empty() {
+            self.headers.insert(node, header_cells);
+        }
         Some(node)
     }
 
-    fn table_rows<'d>(&mut self, el: ElementRef<'d>, s: &Rc<Style>, rows: &mut Vec<(ElementRef<'d>, Rc<Style>)>, captions: &mut Vec<NodeId>) {
+    /// Rows of a table (thead first, tfoot last); returns the number of <thead> rows.
+    fn table_rows<'d>(&mut self, el: ElementRef<'d>, s: &Rc<Style>, rows: &mut Vec<(ElementRef<'d>, Rc<Style>)>, captions: &mut Vec<NodeId>) -> usize {
         // thead first, tfoot last, like a browser
         let mut groups: [Vec<(ElementRef<'d>, Rc<Style>)>; 3] = Default::default();
         for child in el.children().filter_map(ElementRef::wrap) {
@@ -978,7 +1040,9 @@ impl Builder<'_> {
                 _ => {}
             }
         }
+        let header_rows = groups[0].len();
         rows.extend(groups.into_iter().flatten());
+        header_rows
     }
 }
 

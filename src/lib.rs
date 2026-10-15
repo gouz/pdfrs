@@ -187,25 +187,36 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     doc.set_metadata(meta);
 
     let n = pages.len();
-    for (i, &(start, end)) in pages.iter().enumerate() {
+    for (i, pg) in pages.iter().enumerate() {
+        let (start, end) = (pg.start, pg.end);
         let mut page = doc.start_page_with(PageSettings::from_wh(pw, ph).ok_or("invalid page size")?);
         // (x, y, w, h, href) in page coordinates
         let mut links: Vec<(f32, f32, f32, f32, String)> = Vec::new();
         {
             let mut s = page.surface();
+            // a table continued from the previous page: its <thead> again on top
+            let hh = pg.header_height();
+            if let (Some(h), Some(clip)) = (pg.header, render_clip(pw, mt, hh)) {
+                s.push_clip_path(&clip, &krilla::paint::FillRule::NonZero);
+                s.push_transform(&krilla::geom::Transform::from_translate(ml, mt - h.head.0));
+                render::draw(&mut s, &tree, h.table, h.origin.0, h.origin.1, h.head, &mut Vec::new());
+                s.pop();
+                s.pop();
+            }
             // content area: clipped vertically to the slice of the column this page shows
-            if let Some(clip) = render_clip(pw, mt, end - start) {
+            let top = mt + hh;
+            if let Some(clip) = render_clip(pw, top, end - start) {
                 let mut found = Vec::new();
                 s.push_clip_path(&clip, &krilla::paint::FillRule::NonZero);
-                s.push_transform(&krilla::geom::Transform::from_translate(ml, mt - start));
+                s.push_transform(&krilla::geom::Transform::from_translate(ml, top - start));
                 render::draw(&mut s, &tree, tree.root, 0.0, 0.0, (start, end), &mut found);
                 s.pop();
                 s.pop();
                 links.extend(found.into_iter().filter_map(|l| {
-                    let (x, y, w, h) = (l.rect.0 + ml, l.rect.1 + mt - start, l.rect.2, l.rect.3);
+                    let (x, y, w, h) = (l.rect.0 + ml, l.rect.1 + top - start, l.rect.2, l.rect.3);
                     // only links visible in this page's content area
                     let href = tree.links.get(l.href as usize - 1)?.clone();
-                    (y + h > mt && y < mt + (end - start)).then_some((x, y, w, h, href))
+                    (y + h > top && y < top + (end - start)).then_some((x, y, w, h, href))
                 }));
             }
             // header / footer, vertically centered in their margin

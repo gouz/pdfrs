@@ -214,3 +214,39 @@ fn wide_inline_block_shrinks_to_the_line() {
     assert!(right <= 595.28 - 40.0 + 0.5, "text overflows the page: {right}");
     assert!(w.iter().filter(|x| x.0 == "mot").count() == 200);
 }
+
+#[test]
+fn thead_repeats_on_every_page_of_the_table() {
+    if !has_pdftotext() {
+        return;
+    }
+    let rows: String = (0..120).map(|i| format!("<tr><td>r{i}</td><td>{i}</td></tr>")).collect();
+    let html = format!("<p>avant</p><table><thead><tr><th>Entete</th><th>Qte</th></tr></thead><tbody>{rows}</tbody></table><p>apres</p>");
+    let out = pdf(&html, &Options::default());
+    let n = pages(&out);
+    assert!(n >= 3);
+    let text = text_of(&out);
+    assert_eq!(text.matches("Entete").count(), n, "one header per page:\n{text}");
+    // every row once, none hidden under the header
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for i in 0..120 {
+        let row = format!("r{i}");
+        assert_eq!(words.iter().filter(|w| **w == row).count(), 1, "row {row}");
+    }
+}
+
+#[test]
+fn shadows_and_background_images_render() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let html = format!(
+        r#"<div style="box-shadow: 0 4px 12px rgba(0,0,0,.3), 2px 2px 0 red, inset 0 0 4px blue; border-radius: 6px; height: 40px">a</div>
+           <div style="background: url({png}) repeat; background-size: 4px; height: 3000px; border-radius: 10px">tall, tiled</div>
+           <div style="background: url({png}) center / cover no-repeat; width: 50%; height: 60px"></div>
+           <div style="background-image: url(https://x.test/a.png); height: 10px"></div>
+           <div style="box-shadow: 0 0 400px 50px black; width: 5000px; height: 5000px"></div>"#
+    );
+    let t = std::time::Instant::now();
+    let out = pdf(&html, &Options::default());
+    assert!(pages(&out) >= 5);
+    assert!(t.elapsed().as_secs_f32() < 10.0, "too slow: {:?}", t.elapsed());
+}

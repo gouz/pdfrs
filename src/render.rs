@@ -4,8 +4,8 @@
 //! Cuts never split a text line, an image or a `break-inside: avoid` box shorter than a page
 //! (they are moved to the next page); boxes that span a cut are drawn on both pages, clipped.
 
-use crate::layout::{Brush, Deco, ImageKind, ImageLeaf, Leaf, TextLeaf, Tree};
-use crate::style::{self, BorderStyle, Gradient, GradientKind, Len, ObjectFit, Rgba};
+use crate::layout::{BgLayer, Brush, Deco, ImageKind, ImageLeaf, Leaf, TextLeaf, Tree};
+use crate::style::{self, BgSize, BorderStyle, Gradient, GradientKind, Len, ObjectFit, Rgba, Shadow};
 use krilla::color::rgb;
 use krilla::geom::{Path, PathBuilder, Point, Rect, Size, Transform};
 use krilla::num::NormalizedF32;
@@ -24,20 +24,53 @@ pub struct Breaks {
     forced: Vec<f32>,
     /// bottom of the last visible thing (text, image, background, border)
     bottom: f32,
+    tables: Vec<TableHead>,
+}
+
+/// A table with a <thead>: where it is, to repeat its header on the pages it continues on.
+#[derive(Clone, Copy, Debug)]
+pub struct TableHead {
+    pub table: NodeId,
+    /// absolute origin of the table's parent (what draw() takes)
+    pub origin: (f32, f32),
+    /// header rows, absolute y range
+    pub head: (f32, f32),
+    pub bottom: f32,
+}
+
+/// A page: the slice [start, end) of the column, under a repeated table header if any.
+#[derive(Clone, Copy, Debug)]
+pub struct Page {
+    pub start: f32,
+    pub end: f32,
+    pub header: Option<TableHead>,
+}
+
+impl Page {
+    pub fn header_height(&self) -> f32 {
+        self.header.map_or(0.0, |h| h.head.1 - h.head.0)
+    }
 }
 
 pub fn collect_breaks(tree: &Tree) -> Breaks {
     let mut b = Breaks::default();
-    walk_breaks(tree, tree.root, 0.0, &mut b);
+    walk_breaks(tree, tree.root, 0.0, 0.0, &mut b);
     b.bottom = b.atoms.iter().map(|a| a.1).fold(b.bottom, f32::max);
     b.atoms.sort_by(|a, b| a.0.total_cmp(&b.0));
     b.forced.sort_by(f32::total_cmp);
     b
 }
 
-fn walk_breaks(tree: &Tree, n: NodeId, oy: f32, b: &mut Breaks) {
+fn walk_breaks(tree: &Tree, n: NodeId, ox: f32, oy: f32, b: &mut Breaks) {
     let Ok(l) = tree.taffy.layout(n) else { return };
-    let y = oy + l.location.y;
+    let (x, y) = (ox + l.location.x, oy + l.location.y);
+    if let Some(cells) = tree.headers.get(&n) {
+        let rows = cells.iter().filter_map(|c| tree.taffy.layout(*c).ok()).map(|c| (y + c.location.y, y + c.location.y + c.size.height));
+        let head = rows.fold((f32::INFINITY, f32::NEG_INFINITY), |a, r| (a.0.min(r.0), a.1.max(r.1)));
+        if head.0.is_finite() {
+            b.tables.push(TableHead { table: n, origin: (ox, oy), head, bottom: y + l.size.height });
+        }
+    }
     if let Some(d) = tree.deco.get(&n) {
         if d.break_before {
             b.forced.push(y);
@@ -48,7 +81,7 @@ fn walk_breaks(tree: &Tree, n: NodeId, oy: f32, b: &mut Breaks) {
         if d.avoid_break_inside {
             b.atoms.push((y, y + l.size.height));
         }
-        if d.background.is_some() || d.border_width.iter().any(|w| *w > 0.0) {
+        if d.background.is_some() || d.gradient.is_some() || d.bg_image.is_some() || d.border_width.iter().any(|w| *w > 0.0) {
             b.bottom = b.bottom.max(y + l.size.height);
         }
     }
@@ -63,17 +96,30 @@ fn walk_breaks(tree: &Tree, n: NodeId, oy: f32, b: &mut Breaks) {
         Some(Leaf::Image(_)) => b.atoms.push((y, y + l.size.height)),
         None => {}
     }
+    if tree.cells.contains(&n) {
+        b.atoms.push((y, y + l.size.height));
+    }
     for c in tree.taffy.child_ids(n) {
-        walk_breaks(tree, c, y, b);
+        walk_breaks(tree, c, x, y, b);
     }
 }
 
-/// Page cuts [start, end) of the column, pages of `page` high. Always at least one page.
-pub fn paginate(page: f32, breaks: &Breaks) -> Vec<(f32, f32)> {
+/// Pages of `page_height`, cut so no unbreakable range is split. Always at least one page.
+/// A page that starts inside the body of a table with a <thead> repeats the header on top
+/// (and has that much less room).
+pub fn paginate(page_height: f32, breaks: &Breaks) -> Vec<Page> {
     const EPS: f32 = 0.01;
     let mut pages = Vec::new();
     let mut start = 0.0f32;
     loop {
+        // innermost table whose body continues here
+        let header = breaks
+            .tables
+            .iter()
+            .filter(|t| start > 0.0 && t.head.1 <= start + EPS && start < t.bottom - EPS && t.head.1 - t.head.0 <= page_height / 2.0)
+            .max_by(|a, b| a.head.0.total_cmp(&b.head.0))
+            .copied();
+        let page = page_height - header.map_or(0.0, |h| h.head.1 - h.head.0);
         let limit = start + page;
         let mut cut = breaks.forced.iter().copied().find(|&f| f > start + EPS && f < limit).unwrap_or(limit);
         // move the cut above any unbreakable range it crosses, until it crosses none
@@ -93,7 +139,7 @@ pub fn paginate(page: f32, breaks: &Breaks) -> Vec<(f32, f32)> {
         if cut <= start + EPS {
             cut = limit;
         }
-        pages.push((start, cut));
+        pages.push(Page { start, end: cut, header });
         start = cut;
         // stop when nothing visible remains below the cut (forced breaks at the very end included)
         if breaks.bottom <= start + EPS || pages.len() >= 10_000 {
@@ -304,7 +350,177 @@ fn stroke(c: Rgba, w: f32, style: BorderStyle) -> Stroke {
     }
 }
 
-fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32) {
+/// Outer box shadows, the last one at the bottom (as in CSS). Inset shadows are not drawn.
+fn draw_shadows(s: &mut Surface, shadows: &[Shadow], radius: [f32; 4], x: f32, y: f32, w: f32, h: f32) {
+    for sh in shadows.iter().rev().filter(|sh| !sh.inset && sh.color.3 > 0) {
+        let (sx, sy, sw, sh_h) = (x + sh.dx - sh.spread, y + sh.dy - sh.spread, w + 2.0 * sh.spread, h + 2.0 * sh.spread);
+        if sw <= 0.0 || sh_h <= 0.0 {
+            continue;
+        }
+        let r = radius.map(|r| if r > 0.0 { (r + sh.spread).max(0.0) } else { 0.0 });
+        if sh.blur <= 0.0 {
+            if let Some(p) = rounded_path(sx, sy, sw, sh_h, r) {
+                s.set_stroke(None);
+                s.set_fill(Some(fill(sh.color)));
+                s.draw_path(&p);
+            }
+        } else if let Some((image, pad, (iw, ih))) = blurred(sw, sh_h, r, sh.blur, sh.color) {
+            s.push_transform(&Transform::from_translate(sx - pad, sy - pad));
+            if let Some(size) = Size::from_wh(iw, ih) {
+                s.draw_image(image, size);
+            }
+            s.pop();
+        }
+    }
+}
+
+/// A blurred rounded rectangle as an RGBA bitmap: (image, padding around the rectangle, drawn size).
+/// The CSS blur radius is two standard deviations; three box blurs approximate the gaussian.
+fn blurred(w: f32, h: f32, r: [f32; 4], blur: f32, c: Rgba) -> Option<(krilla::image::Image, f32, (f32, f32))> {
+    let sigma = blur / 2.0;
+    let pad = 3.0 * sigma;
+    let (fw, fh) = (w + 2.0 * pad, h + 2.0 * pad);
+    // ~2 px per pt, at most ~1.5 M pixels
+    let k = (2.0f32).min((1_500_000.0 / (fw * fh)).sqrt()).max(0.05);
+    let (pw, ph) = ((fw * k).ceil() as usize, (fh * k).ceil() as usize);
+    if pw == 0 || ph == 0 || pw > 8192 || ph > 8192 {
+        return None;
+    }
+    // coverage of the rounded rectangle, from its signed distance
+    let (cx, cy, hw, hh) = (pad + w / 2.0, pad + h / 2.0, w / 2.0, h / 2.0);
+    let mut a = vec![0f32; pw * ph];
+    for j in 0..ph {
+        let py = (j as f32 + 0.5) / k;
+        for i in 0..pw {
+            let px = (i as f32 + 0.5) / k;
+            let (dx, dy) = (px - cx, py - cy);
+            let rr = match (dx < 0.0, dy < 0.0) {
+                (true, true) => r[0],
+                (false, true) => r[1],
+                (false, false) => r[2],
+                (true, false) => r[3],
+            }
+            .min(hw)
+            .min(hh);
+            let (qx, qy) = (dx.abs() - (hw - rr), dy.abs() - (hh - rr));
+            let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - rr;
+            a[j * pw + i] = (0.5 - d * k).clamp(0.0, 1.0);
+        }
+    }
+    // box size per pass for a gaussian of sigma (in px)
+    let sp = sigma * k;
+    let box_r = (((12.0 * sp * sp / 3.0 + 1.0).sqrt() - 1.0) / 2.0).round().max(1.0) as usize;
+    let mut tmp = vec![0f32; pw * ph];
+    for _ in 0..3 {
+        box_blur(&a, &mut tmp, pw, ph, box_r, true);
+        box_blur(&tmp, &mut a, pw, ph, box_r, false);
+    }
+    let alpha = c.3 as f32;
+    let mut rgba = Vec::with_capacity(pw * ph * 4);
+    for v in a {
+        rgba.extend_from_slice(&[c.0, c.1, c.2, (v * alpha).round().clamp(0.0, 255.0) as u8]);
+    }
+    Some((krilla::image::Image::from_rgba8(rgba, pw as u32, ph as u32), pad, (pw as f32 / k, ph as f32 / k)))
+}
+
+/// One running-sum box blur pass of radius `r`, along rows or columns (edges clamped to 0).
+fn box_blur(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizontal: bool) {
+    let (lines, len) = if horizontal { (h, w) } else { (w, h) };
+    let at = |line: usize, i: usize| if horizontal { line * w + i } else { i * w + line };
+    let norm = 1.0 / (2 * r + 1) as f32;
+    for line in 0..lines {
+        let mut sum = 0.0;
+        for i in 0..r.min(len) {
+            sum += src[at(line, i)];
+        }
+        for i in 0..len {
+            if i + r < len {
+                sum += src[at(line, i + r)];
+            }
+            if i > r {
+                sum -= src[at(line, i - r - 1)];
+            }
+            dst[at(line, i)] = sum * norm;
+        }
+    }
+}
+
+/// `background-image: url()`: tiles over the padding box, clipped to the border box.
+fn draw_bg_image(s: &mut Surface, bg: &BgLayer, d: &Deco, x: f32, y: f32, w: f32, h: f32, window: (f32, f32)) {
+    let (nw, nh) = bg.natural;
+    let [bt, br, bb, bl] = d.border_width;
+    let (ax, ay, aw, ah) = (x + bl, y + bt, (w - bl - br).max(0.0), (h - bt - bb).max(0.0));
+    if nw <= 0.0 || nh <= 0.0 || aw <= 0.0 || ah <= 0.0 {
+        return;
+    }
+    let (tw, th) = match bg.size {
+        BgSize::Auto => (nw, nh),
+        BgSize::Cover => {
+            let k = (aw / nw).max(ah / nh);
+            (nw * k, nh * k)
+        }
+        BgSize::Contain => {
+            let k = (aw / nw).min(ah / nh);
+            (nw * k, nh * k)
+        }
+        BgSize::Size(a, b) => match (a, b) {
+            (Len::Auto, Len::Auto) => (nw, nh),
+            (a, Len::Auto) => {
+                let tw = style::resolve(a, aw);
+                (tw, tw * nh / nw)
+            }
+            (Len::Auto, b) => {
+                let th = style::resolve(b, ah);
+                (th * nw / nh, th)
+            }
+            (a, b) => (style::resolve(a, aw), style::resolve(b, ah)),
+        },
+    };
+    if tw < 0.5 || th < 0.5 {
+        return;
+    }
+    // percentages position the image's point at the area's point (CSS)
+    let px = ax + style::resolve(bg.position.0, aw - tw);
+    let py = ay + style::resolve(bg.position.1, ah - th);
+    let xs: Vec<f32> = if bg.repeat.0 {
+        let first = px - ((px - x) / tw).ceil() * tw;
+        (0..).map(|i| first + i as f32 * tw).take_while(|t| *t < x + w).take(512).collect()
+    } else {
+        vec![px]
+    };
+    let ys: Vec<f32> = if bg.repeat.1 {
+        let first = py - ((py - y) / th).ceil() * th;
+        (0..).map(|i| first + i as f32 * th).take_while(|t| *t < y + h).take(512).collect()
+    } else {
+        vec![py]
+    };
+    let Some(clip) = rounded_path(x, y, w, h, d.radius) else { return };
+    let Some(size) = Size::from_wh(tw, th) else { return };
+    s.push_clip_path(&clip, &FillRule::NonZero);
+    let mut drawn = 0;
+    for &ty in ys.iter().filter(|ty| **ty < window.1 && **ty + th > window.0) {
+        for &tx in &xs {
+            if drawn >= 4096 {
+                break;
+            }
+            s.push_transform(&Transform::from_translate(tx, ty));
+            match &bg.kind {
+                ImageKind::Raster(i) => s.draw_image(i.clone(), size),
+                ImageKind::Svg(tree) => {
+                    s.draw_svg(tree, size, SvgSettings::default());
+                }
+            }
+            s.pop();
+            drawn += 1;
+        }
+    }
+    s.pop();
+}
+
+fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, window: (f32, f32)) {
+    if let Some(shadows) = &d.shadows {
+        draw_shadows(s, shadows, d.radius, x, y, w, h);
+    }
     if let Some(bg) = d.background {
         if let Some(p) = rounded_path(x, y, w, h, d.radius) {
             s.set_stroke(None);
@@ -318,6 +534,9 @@ fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32) {
             s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: FillRule::NonZero }));
             s.draw_path(&p);
         }
+    }
+    if let Some(bg) = &d.bg_image {
+        draw_bg_image(s, bg, d, x, y, w, h, window);
     }
     let bw = d.border_width;
     if bw.iter().all(|w| *w <= 0.0) {
@@ -536,8 +755,10 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
                 pushed += 3;
             }
         }
-        if y < window.1 && y + h > window.0 {
-            draw_box(s, d, x, y, w, h);
+        // shadows reach outside the box
+        let reach = d.shadows.as_ref().map_or(0.0, |sh| sh.iter().map(|s| s.dy.abs() + s.spread.max(0.0) + 1.5 * s.blur).fold(0.0, f32::max));
+        if y - reach < window.1 && y + h + reach > window.0 {
+            draw_box(s, d, x, y, w, h, window);
         }
         if d.clip {
             if let Some(p) = rounded_path(x, y, w, h, d.radius) {

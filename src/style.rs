@@ -146,6 +146,26 @@ pub enum GradientKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BgSize {
+    Auto,
+    Cover,
+    Contain,
+    /// width, height (each may be Len::Auto: keeps the image's ratio)
+    Size(Len, Len),
+}
+
+/// One `box-shadow`
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    pub dx: f32,
+    pub dy: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Rgba,
+    pub inset: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ObjectFit {
     Contain,
     Cover,
@@ -199,6 +219,12 @@ pub struct Style {
     pub radius: [f32; 4],
     pub background: Option<Rgba>,
     pub gradient: Option<Rc<Gradient>>,
+    /// `background-image: url(...)` (first layer), `background-size`, `-position`, `-repeat` (x, y)
+    pub bg_image: Option<Rc<str>>,
+    pub bg_size: BgSize,
+    pub bg_position: (Len, Len),
+    pub bg_repeat: (bool, bool),
+    pub shadows: Option<Rc<Vec<Shadow>>>,
     pub opacity: f32,
     /// `transform` / `transform-origin`, resolved at draw time (they depend on the box size)
     pub transform_fn: Option<Rc<str>>,
@@ -273,6 +299,11 @@ impl Style {
             radius: [0.0; 4],
             background: None,
             gradient: None,
+            bg_image: None,
+            bg_size: BgSize::Auto,
+            bg_position: (Len::Pct(0.0), Len::Pct(0.0)),
+            bg_repeat: (true, true),
+            shadows: None,
             opacity: 1.0,
             transform_fn: None,
             transform_origin: None,
@@ -706,6 +737,23 @@ pub fn position(v: &str, em: f32, rem: f32) -> (Len, Len) {
         "right" | "bottom" => Some(Len::Pct(100.0)),
         _ => None,
     };
+    if words.len() >= 3 {
+        // `right 10px top`, `left 5% bottom 2px`: edge keywords with offsets
+        let mut i = 0;
+        while i < words.len() {
+            let w = words[i].as_str();
+            let off = words.get(i + 1).and_then(|o| len(o, em, rem)).filter(|_| !matches!(words[i + 1].as_str(), "left" | "right" | "top" | "bottom" | "center"));
+            let v = match (w, off) {
+                ("left" | "top", Some(o)) => o,
+                ("right" | "bottom", Some(Len::Px(o))) => Len::Calc(-o, 100.0),
+                ("right" | "bottom", Some(Len::Pct(p))) => Len::Pct(100.0 - p),
+                (_, _) => kw(w).unwrap_or(Len::Pct(50.0)),
+            };
+            if matches!(w, "top" | "bottom") { y = v } else if w != "center" || i == 0 { x = v }
+            i += if off.is_some() { 2 } else { 1 };
+        }
+        return (x, y);
+    }
     match words.as_slice() {
         [a] if a == "top" || a == "bottom" => y = kw(a).unwrap(),
         [a] => x = kw(a).or_else(|| len(a, em, rem)).unwrap_or(x),
@@ -718,6 +766,69 @@ pub fn position(v: &str, em: f32, rem: f32) -> (Len, Len) {
         _ => {}
     }
     (x, y)
+}
+
+/// `url(x)`, `url("x")` -> x
+pub fn url(v: &str) -> Option<String> {
+    let inner = v.trim().strip_prefix("url(").or_else(|| v.trim().strip_prefix("URL("))?.strip_suffix(')')?;
+    let inner = inner.trim().trim_matches(|c| c == '"' || c == '\'');
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+/// `center / cover` -> ("center", Some("cover")), outside parentheses
+fn split_slash(layer: &str) -> (&str, Option<&str>) {
+    let mut depth = 0;
+    for (i, c) in layer.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '/' if depth == 0 => return (&layer[..i], Some(&layer[i + 1..])),
+            _ => {}
+        }
+    }
+    (layer, None)
+}
+
+fn repeat(v: &str) -> Option<(bool, bool)> {
+    Some(match v {
+        "repeat" | "space" | "round" => (true, true),
+        "no-repeat" => (false, false),
+        "repeat-x" => (true, false),
+        "repeat-y" => (false, true),
+        _ => return None,
+    })
+}
+
+fn bg_size(v: &str, em: f32, rem: f32) -> Option<BgSize> {
+    let words = split_values(&v.trim().to_ascii_lowercase());
+    Some(match words.as_slice() {
+        [w] if w == "cover" => BgSize::Cover,
+        [w] if w == "contain" => BgSize::Contain,
+        [w] if w == "auto" => BgSize::Auto,
+        [w] => BgSize::Size(len(w, em, rem)?, Len::Auto),
+        [w, h] => BgSize::Size(len(w, em, rem)?, len(h, em, rem)?),
+        _ => return None,
+    })
+}
+
+/// `box-shadow`: comma separated `[inset] dx dy [blur [spread]] [color]`
+fn shadows(v: &str, em: f32, rem: f32, current: Rgba) -> Option<Vec<Shadow>> {
+    let mut out = Vec::new();
+    for layer in crate::css::split_top_level(v, ',') {
+        let (mut lens, mut color, mut inset) = (Vec::new(), current, false);
+        for w in split_values(layer) {
+            if w.eq_ignore_ascii_case("inset") {
+                inset = true;
+            } else if let Some(l) = len(&w, em, rem).and_then(Len::px) {
+                lens.push(l);
+            } else {
+                color = css_color(&w, current)?;
+            }
+        }
+        let [dx, dy] = [*lens.first()?, *lens.get(1)?];
+        out.push(Shadow { dx, dy, blur: lens.get(2).copied().unwrap_or(0.0).max(0.0), spread: lens.get(3).copied().unwrap_or(0.0), color, inset });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Resolve a length against a basis (percentages, calc)
@@ -1106,22 +1217,75 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
         }
         "background-color" => s.background = css_color(v, s.color).filter(|c| c.3 > 0),
         "background" => {
-            // the color layer, and the first gradient layer
+            // the color, the first gradient and the first url() image with its size / position / repeat
             s.background = None;
             s.gradient = None;
+            s.bg_image = None;
+            (s.bg_size, s.bg_position, s.bg_repeat) = (BgSize::Auto, (Len::Pct(0.0), Len::Pct(0.0)), (true, true));
             for layer in crate::css::split_top_level(v, ',') {
-                for word in split_values(layer) {
-                    if word.contains("gradient(") {
+                let (pos_part, size_part) = split_slash(layer);
+                // after the `/`: one or two size words, then the layer goes on (`/ cover no-repeat`)
+                let (mut size_words, mut rest) = (Vec::new(), Vec::new());
+                for w in size_part.map(split_values).unwrap_or_default() {
+                    let lw = w.to_ascii_lowercase();
+                    let is_size = matches!(lw.as_str(), "cover" | "contain" | "auto") || len(&lw, em, rem).is_some();
+                    if is_size && rest.is_empty() && size_words.len() < 2 && !(size_words.first().is_some_and(|f: &String| f == "cover" || f == "contain")) {
+                        size_words.push(lw);
+                    } else {
+                        rest.push(w);
+                    }
+                }
+                let mut pos_words = Vec::new();
+                let mut has_image = false;
+                for word in split_values(pos_part).into_iter().chain(rest) {
+                    let lw = word.to_ascii_lowercase();
+                    if lw.contains("gradient(") {
                         if s.gradient.is_none() {
                             s.gradient = gradient(&word, em, rem, s.color).map(Rc::new);
                         }
+                    } else if lw.starts_with("url(") {
+                        if s.bg_image.is_none() {
+                            s.bg_image = url(&word).map(Rc::from);
+                            has_image = true;
+                        }
+                    } else if let Some(r) = repeat(&lw) {
+                        s.bg_repeat = r;
+                    } else if matches!(lw.as_str(), "fixed" | "scroll" | "local" | "border-box" | "padding-box" | "content-box" | "text" | "none") {
                     } else if let Some(c) = css_color(&word, s.color) {
                         s.background = Some(c).filter(|c| c.3 > 0);
+                    } else {
+                        pos_words.push(word);
+                    }
+                }
+                if has_image {
+                    if !pos_words.is_empty() {
+                        s.bg_position = position(&pos_words.join(" "), em, rem);
+                    }
+                    if let Some(size) = (!size_words.is_empty()).then(|| bg_size(&size_words.join(" "), em, rem)).flatten() {
+                        s.bg_size = size;
                     }
                 }
             }
         }
-        "background-image" => s.gradient = crate::css::split_top_level(v, ',').find_map(|l| gradient(l, em, rem, s.color)).map(Rc::new),
+        "background-image" => {
+            s.gradient = crate::css::split_top_level(v, ',').find_map(|l| gradient(l, em, rem, s.color)).map(Rc::new);
+            s.bg_image = crate::css::split_top_level(v, ',').find_map(|l| url(l.trim())).map(Rc::from);
+        }
+        "background-size" => {
+            if let Some(size) = crate::css::split_top_level(v, ',').next().and_then(|l| bg_size(l, em, rem)) {
+                s.bg_size = size;
+            }
+        }
+        "background-position" => s.bg_position = position(crate::css::split_top_level(v, ',').next().unwrap_or(""), em, rem),
+        "background-repeat" => {
+            let first = crate::css::split_top_level(&lv, ',').next().unwrap_or("").trim().to_string();
+            match first.split_whitespace().collect::<Vec<_>>().as_slice() {
+                [one] => s.bg_repeat = repeat(one).unwrap_or(s.bg_repeat),
+                [x, y] => s.bg_repeat = (*x != "no-repeat", *y != "no-repeat"),
+                _ => {}
+            }
+        }
+        "box-shadow" => s.shadows = if lv == "none" { None } else { shadows(v, em, rem, s.color).map(Rc::new) },
         "direction" => s.rtl = lv == "rtl",
         "content" => s.content = Some(v.trim().into()),
         "transform" => s.transform_fn = (lv != "none").then(|| v.trim().into()),
@@ -1461,6 +1625,26 @@ mod tests {
         assert_eq!(content("\"\"", attr).as_deref(), Some(""));
         assert_eq!(content("none", attr), None);
         assert_eq!(content("counter(item) \". \"", attr).as_deref(), Some(". "));
+    }
+
+    #[test]
+    fn backgrounds_and_shadows() {
+        let s = computed("background: #fff url('img/a.png') no-repeat right 10px top / 50% auto");
+        assert_eq!(s.bg_image.as_deref(), Some("img/a.png"));
+        assert_eq!(s.background, Some(Rgba(255, 255, 255, 255)));
+        assert_eq!(s.bg_repeat, (false, false));
+        assert_eq!(s.bg_size, BgSize::Size(Len::Pct(50.0), Len::Auto));
+        assert_eq!(s.bg_position, (Len::Calc(-10.0, 100.0), Len::Pct(0.0)));
+        let s = computed("background: #222 url(a.png) center / contain no-repeat");
+        assert_eq!((s.bg_size, s.bg_repeat, s.background), (BgSize::Contain, (false, false), Some(Rgba(34, 34, 34, 255))));
+        let s = computed("background-image: url(a.png); background-size: cover; background-position: center; background-repeat: repeat-x");
+        assert_eq!((s.bg_size, s.bg_position, s.bg_repeat), (BgSize::Cover, (Len::Pct(50.0), Len::Pct(50.0)), (true, false)));
+        let s = computed("color: red; box-shadow: 0 2px 4px rgba(0, 0, 0, .5), inset 1px 1px blue, 3px 3px 0 2px");
+        let sh = s.shadows.unwrap();
+        assert_eq!(sh[0], Shadow { dx: 0.0, dy: 2.0, blur: 4.0, spread: 0.0, color: Rgba(0, 0, 0, 128), inset: false });
+        assert!(sh[1].inset && sh[1].color == Rgba(0, 0, 255, 255));
+        assert_eq!((sh[2].spread, sh[2].color), (2.0, Rgba(255, 0, 0, 255)));
+        assert!(computed("box-shadow: 1px").shadows.is_none());
     }
 
     #[test]
