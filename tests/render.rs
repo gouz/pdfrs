@@ -478,3 +478,22 @@ fn remote_resources_when_enabled() {
     let text = text_of(&pdf(&html, &Options::default()));
     assert!(!text.contains("[remote css]"));
 }
+
+#[test]
+fn gradient_text_and_fixed_backgrounds() {
+    if !has_pdftotext() {
+        return;
+    }
+    let lines = "<p>ligne</p>".repeat(120);
+    let html = format!(
+        r#"<style>
+          h1 {{ background: linear-gradient(90deg, red, blue); -webkit-background-clip: text; -webkit-text-fill-color: transparent }}
+          body {{ background: #fafafa linear-gradient(red, blue) fixed no-repeat; background-size: 100px 50px }}
+        </style><h1>Titre <em>dégradé</em></h1>{lines}"#
+    );
+    let out = pdf(&html, &Options::default());
+    assert!(pages(&out) >= 2);
+    // the text stays real text, painted with a shading
+    assert!(text_of(&out).contains("Titre dégradé"));
+    assert!(String::from_utf8_lossy(&out).contains("/Shading"));
+}

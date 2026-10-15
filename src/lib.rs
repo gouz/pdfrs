@@ -223,6 +223,11 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
 
     let mut tree = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, cw, &mut lcx.borrow_mut()));
     tree.compute(cw);
+    // the root's background goes to the whole page (the canvas), its borders stay on the root box
+    let canvas = tree.deco.get_mut(&tree.root).and_then(|d| {
+        let c = layout::Deco { background: d.background.take(), layers: std::mem::take(&mut d.layers), color_clip: d.color_clip, ..Default::default() };
+        (c.background.is_some() || !c.layers.is_empty()).then_some(c)
+    });
     let breaks = render::collect_breaks(&tree);
     let pages = render::paginate((ph - first_mt - first_mb).max(1.0), ch, &breaks);
     // header / footer: the request's, else the @page margin boxes
@@ -261,6 +266,9 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
         let mut links: Vec<(f32, f32, f32, f32, String)> = Vec::new();
         {
             let mut s = page.surface();
+            if let Some(c) = &canvas {
+                render::draw_canvas(&mut s, c, pw, ph);
+            }
             // a table continued from the previous page: its <thead> again on top
             let hh = pg.header_height();
             if let (Some(h), Some(head), Some(clip)) = (pg.header, pg.header.and_then(|h| h.head), render_clip(pw, mt, hh)) {

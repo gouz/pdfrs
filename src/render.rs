@@ -504,7 +504,7 @@ fn area(which: BoxArea, (x, y, w, h): (f32, f32, f32, f32), d: &Deco, pad: [f32;
     let shrink = |radius: [f32; 4], [t, r, b, l]: [f32; 4]| [radius[0] - t.max(l), radius[1] - t.max(r), radius[2] - b.max(r), radius[3] - b.max(l)].map(|v| v.max(0.0));
     let border = (x, y, w, h);
     match which {
-        BoxArea::Border => (border, d.radius),
+        BoxArea::Border | BoxArea::Text => (border, d.radius),
         BoxArea::Padding => (inset(border, d.border_width), shrink(d.radius, d.border_width)),
         BoxArea::Content => {
             let total = [bt + pad[0], br + pad[1], bb + pad[2], bl + pad[3]];
@@ -514,8 +514,15 @@ fn area(which: BoxArea, (x, y, w, h): (f32, f32, f32, f32), d: &Deco, pad: [f32;
 }
 
 /// One background layer: tiles over its origin box, clipped to its clip box.
-fn draw_layer(s: &mut Surface, layer: &BgLayer, d: &Deco, rect: (f32, f32, f32, f32), pad: [f32; 4], window: (f32, f32)) {
-    let ((ax, ay, aw, ah), _) = area(layer.origin, rect, d, pad);
+fn draw_layer(s: &mut Surface, layer: &BgLayer, d: &Deco, rect: (f32, f32, f32, f32), pad: [f32; 4], window: (f32, f32), page: Option<(f32, f32, f32, f32)>) {
+    if layer.clip == BoxArea::Text {
+        return; // paints the text instead (draw_text)
+    }
+    // fixed: positioned against the page (repeated on every page), as browsers print it
+    let ((ax, ay, aw, ah), _) = match page.filter(|_| layer.fixed) {
+        Some(p) => (p, [0.0; 4]),
+        None => area(layer.origin, rect, d, pad),
+    };
     let ((cx, cy, cw, ch), cr) = area(layer.clip, rect, d, pad);
     if aw <= 0.0 || ah <= 0.0 || cw <= 0.0 || ch <= 0.0 {
         return;
@@ -602,12 +609,13 @@ fn draw_layer(s: &mut Surface, layer: &BgLayer, d: &Deco, rect: (f32, f32, f32, 
 }
 
 /// Shadows, background (color, then layers bottom to top), inset shadows, borders.
-fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, pad: [f32; 4], window: (f32, f32)) {
+#[allow(clippy::too_many_arguments)]
+fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, pad: [f32; 4], window: (f32, f32), page: Option<(f32, f32, f32, f32)>) {
     let rect = (x, y, w, h);
     if let Some(shadows) = &d.shadows {
         draw_shadows(s, shadows, d.radius, x, y, w, h);
     }
-    if let Some(bg) = d.background {
+    if let Some(bg) = d.background.filter(|_| d.color_clip != BoxArea::Text) {
         let ((cx, cy, cw, ch), cr) = area(d.color_clip, rect, d, pad);
         if let Some(p) = rounded_path(cx, cy, cw, ch, cr) {
             s.set_stroke(None);
@@ -616,7 +624,7 @@ fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, pad: [f32
         }
     }
     for layer in d.layers.iter().rev() {
-        draw_layer(s, layer, d, rect, pad, window);
+        draw_layer(s, layer, d, rect, pad, window, page);
     }
     if let Some(shadows) = d.shadows.as_ref().filter(|sh| sh.iter().any(|s| s.inset)) {
         let (inner, r) = area(BoxArea::Padding, rect, d, pad);
@@ -704,7 +712,42 @@ pub struct Link {
     pub href: u32,
 }
 
-fn draw_text(s: &mut Surface, tree: &Tree, t: &TextLeaf, x: f32, y: f32, window: (f32, f32), links: &mut Vec<Link>) {
+/// Position of a node's border box from the root of its (sub)tree.
+fn tree_pos(tree: &Tree, mut n: NodeId) -> (f32, f32) {
+    let (mut x, mut y) = (0.0, 0.0);
+    loop {
+        let Ok(l) = tree.taffy.layout(n) else { break };
+        x += l.location.x;
+        y += l.location.y;
+        match tree.taffy.parent(n) {
+            Some(p) => n = p,
+            None => break,
+        }
+    }
+    (x, y)
+}
+
+/// The gradient of a `background-clip: text` element, laid over that element's box, for the text of
+/// leaf `leaf` drawn with its content box at (x, y).
+fn text_fill_paint(tree: &Tree, fill: u32, leaf: NodeId, x: f32, y: f32) -> Option<Paint> {
+    let el = *tree.text_fills.get(fill.checked_sub(1)? as usize)?;
+    let d = tree.deco.get(&el)?;
+    let layer = d.layers.iter().find(|l| l.clip == BoxArea::Text && matches!(l.paint, LayerPaint::Gradient(_)))?;
+    let LayerPaint::Gradient(g) = &layer.paint else { return None };
+    // from tree coordinates to drawing coordinates, through the leaf's known position
+    let ll = tree.taffy.layout(leaf).ok()?;
+    let (lx, ly) = tree_pos(tree, leaf);
+    let (dx, dy) = (x - lx - ll.padding.left - ll.border.left, y - ly - ll.padding.top - ll.border.top);
+    let el_l = tree.taffy.layout(el).ok()?;
+    let (ex, ey) = tree_pos(tree, el);
+    let rect = (ex + dx, ey + dy, el_l.size.width, el_l.size.height);
+    let pad = [el_l.padding.top, el_l.padding.right, el_l.padding.bottom, el_l.padding.left];
+    let ((ax, ay, aw, ah), _) = area(layer.origin, rect, d, pad);
+    gradient_paint(g, ax, ay, aw, ah)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text(s: &mut Surface, tree: &Tree, leaf: NodeId, t: &TextLeaf, x: f32, y: f32, window: (f32, f32), links: &mut Vec<Link>) {
     for line in t.layout.lines() {
         let m = line.metrics();
         if y + m.block_max_coord <= window.0 || y + m.block_min_coord >= window.1 {
@@ -757,7 +800,10 @@ fn draw_text(s: &mut Surface, tree: &Tree, t: &TextLeaf, x: f32, y: f32, window:
                 })
                 .collect();
             s.set_stroke(None);
-            s.set_fill(Some(fill(brush.color)));
+            match (brush.text_fill > 0).then(|| text_fill_paint(tree, brush.text_fill, leaf, x, y)).flatten() {
+                Some(paint) => s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: FillRule::NonZero })),
+                None => s.set_fill(Some(fill(brush.color))),
+            }
             s.draw_glyphs(Point::from_xy(gx, gy), &glyphs, font, &t.text, size, false);
             let fm = run.font_metrics();
             let style = gr.style();
@@ -817,6 +863,12 @@ fn draw_image(s: &mut Surface, img: &ImageLeaf, x: f32, y: f32, w: f32, h: f32) 
     }
 }
 
+/// The root background (html / body), painted on the whole page like a browser's canvas.
+pub fn draw_canvas(s: &mut Surface, canvas: &Deco, pw: f32, ph: f32) {
+    let page = Some((0.0, 0.0, pw, ph));
+    draw_box(s, canvas, 0.0, 0.0, pw, ph, [0.0; 4], (0.0, ph), page);
+}
+
 /// Draw the subtree of `n` whose parent's border box is at (ox, oy); only what crosses `window` (y range).
 pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (f32, f32), links: &mut Vec<Link>) {
     let Ok(l) = tree.taffy.layout(n) else { return };
@@ -842,7 +894,9 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
         // shadows reach outside the box
         let reach = d.shadows.as_ref().map_or(0.0, |sh| sh.iter().map(|s| s.dy.abs() + s.spread.max(0.0) + 1.5 * s.blur).fold(0.0, f32::max));
         if y - reach < window.1 && y + h + reach > window.0 {
-            draw_box(s, d, x, y, w, h, [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left], window);
+            // the page area in column coordinates, for fixed backgrounds (main column only)
+            let page = (window.1 - window.0 < 1e6).then(|| (0.0, window.0, tree.taffy.layout(tree.root).map_or(0.0, |r| r.size.width), window.1 - window.0));
+            draw_box(s, d, x, y, w, h, [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left], window, page);
         }
         if d.clip {
             if let Some(p) = rounded_path(x, y, w, h, d.radius) {
@@ -853,7 +907,7 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
     }
     let (cx, cy) = (x + l.padding.left + l.border.left, y + l.padding.top + l.border.top);
     match tree.taffy.get_node_context(n) {
-        Some(Leaf::Text(t)) => draw_text(s, tree, t, cx, cy, window, links),
+        Some(Leaf::Text(t)) => draw_text(s, tree, n, t, cx, cy, window, links),
         Some(Leaf::Image(img)) if y < window.1 && y + h > window.0 => {
             draw_image(s, img, cx, cy, l.content_box_width(), l.content_box_height());
         }

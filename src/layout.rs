@@ -75,6 +75,8 @@ pub struct Brush {
     pub background: Option<Rgba>,
     /// 1-based index in Tree::links, 0 = not a link
     pub link: u32,
+    /// 1-based index in Tree::text_fills: the element whose `background-clip: text` paints this text
+    pub text_fill: u32,
 }
 
 pub struct TextLeaf {
@@ -116,6 +118,7 @@ pub struct BgLayer {
     pub repeat: (bool, bool),
     pub origin: BoxArea,
     pub clip: BoxArea,
+    pub fixed: bool,
 }
 
 impl std::fmt::Debug for BgLayer {
@@ -191,6 +194,8 @@ pub struct Tree {
     pub footers: HashMap<NodeId, Vec<NodeId>>,
     /// table cells: not split across pages when they fit on one
     pub cells: std::collections::HashSet<NodeId>,
+    /// elements with `background-clip: text` (Brush::text_fill - 1)
+    pub text_fills: Vec<NodeId>,
 }
 
 enum Piece {
@@ -229,6 +234,9 @@ struct Builder<'a> {
     cells: std::collections::HashSet<NodeId>,
     /// `::first-letter` style waiting for the first letter of the current block
     first_letter: Option<Rc<Style>>,
+    /// `background-clip: text` elements (their node, once built), and the one painting the current text
+    text_fills: Vec<Option<NodeId>>,
+    text_fill: u32,
     /// decoded background images by url (the same image is often repeated on many boxes)
     bg_images: HashMap<Rc<str>, Option<(ImageKind, (f32, f32))>>,
 }
@@ -447,6 +455,8 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             footers: HashMap::new(),
             cells: Default::default(),
             first_letter: None,
+            text_fills: Vec::new(),
+            text_fill: 0,
             bg_images: HashMap::new(),
         };
         b.taffy.disable_rounding();
@@ -464,7 +474,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.bg = body_style.bg.clone().or(html_style.bg.clone());
         b.apply_counters(body, &body_style, &mut Vec::new());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, footers: b.footers, cells: b.cells }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, footers: b.footers, cells: b.cells, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect() }
     })
 }
 
@@ -558,7 +568,7 @@ fn valign(v: VAlign) -> parley::VerticalAlign {
 }
 
 fn brush_of(s: &Style) -> Brush {
-    Brush { color: s.color, background: None, link: 0 }
+    Brush { color: s.color, background: None, link: 0, text_fill: 0 }
 }
 
 fn to_taffy(s: &Style) -> taffy::Style {
@@ -741,6 +751,7 @@ impl Builder<'_> {
                     repeat: Background::nth(&bg.repeats, i, (true, true)),
                     origin: Background::nth(&bg.origins, i, BoxArea::Padding),
                     clip: Background::nth(&bg.clips, i, BoxArea::Border),
+                    fixed: Background::nth(&bg.fixed, i, false),
                 }));
             }
         }
@@ -770,7 +781,7 @@ impl Builder<'_> {
         match ps.display {
             Display::None => {}
             Display::Inline | Display::Contents => {
-                let b = Brush { color: ps.color, background: ps.background.or(brush.background), link: brush.link };
+                let b = Brush { color: ps.color, background: ps.background.or(brush.background), ..brush.clone() };
                 ctx.group.push(Piece::Text(text, ps.clone(), b));
             }
             _ => {
@@ -840,7 +851,16 @@ impl Builder<'_> {
                 }
             }
         }
-        let brush = brush_of(&s);
+        // background-clip: text: this element's background paints the text inside it
+        let outer_fill = self.text_fill;
+        let fill_slot = s.bg.as_ref().filter(|b| b.clips.contains(&BoxArea::Text)).map(|_| {
+            self.text_fills.push(None);
+            self.text_fills.len() - 1
+        });
+        if let Some(i) = fill_slot {
+            self.text_fill = i as u32 + 1;
+        }
+        let brush = Brush { text_fill: self.text_fill, ..brush_of(&s) };
         // ::first-letter: styles the first letter of the text that follows (in this box or its first child boxes)
         let mut owns_first_letter = false;
         if self.sheet.has_pseudo {
@@ -859,6 +879,7 @@ impl Builder<'_> {
         if owns_first_letter {
             self.first_letter = None;
         }
+        self.text_fill = outer_fill;
         let mut ts = to_taffy(&s);
         if s.display == Display::TableCell {
             // a cell centers (vertical-align) its content in the row height
@@ -872,6 +893,9 @@ impl Builder<'_> {
         }
         let node = self.taffy.new_with_children(ts, &ctx.children).ok()?;
         self.finish_node(node, &s);
+        if let Some(i) = fill_slot {
+            self.text_fills[i] = Some(node);
+        }
         Some(node)
     }
 
@@ -996,7 +1020,7 @@ impl Builder<'_> {
         if start > 0 {
             ctx.group.push(Piece::Text(text[..start].to_string(), s.clone(), brush.clone()));
         }
-        let b = Brush { color: fl.color, background: fl.background.or(brush.background), link: brush.link };
+        let b = Brush { color: fl.color, background: fl.background.or(brush.background), ..brush.clone() };
         ctx.group.push(Piece::Text(text[start..end].to_string(), fl, b));
         ctx.group.push(Piece::Text(text[end..].to_string(), s.clone(), brush.clone()));
     }

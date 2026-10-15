@@ -170,6 +170,8 @@ pub enum BoxArea {
     Border,
     Padding,
     Content,
+    /// `background-clip: text`: the layer paints the text of the element instead of its box
+    Text,
 }
 
 /// Background layers, first on top. Each list is cycled to the number of images, as in CSS.
@@ -181,6 +183,8 @@ pub struct Background {
     pub repeats: Vec<(bool, bool)>,
     pub origins: Vec<BoxArea>,
     pub clips: Vec<BoxArea>,
+    /// `background-attachment: fixed`: positioned against the page instead of the box
+    pub fixed: Vec<bool>,
 }
 
 impl Background {
@@ -1351,7 +1355,7 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                         rest.push(w);
                     }
                 }
-                let (mut pos_words, mut image, mut rep, mut boxes) = (Vec::new(), None, (true, true), Vec::new());
+                let (mut pos_words, mut image, mut rep, mut boxes, mut fixed) = (Vec::new(), None, (true, true), Vec::new(), false);
                 for word in split_values(pos_part).into_iter().chain(rest) {
                     let lw = word.to_ascii_lowercase();
                     if lw.contains("gradient(") {
@@ -1362,7 +1366,11 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                         rep = r;
                     } else if let Some(b) = box_area(&lw) {
                         boxes.push(b);
-                    } else if matches!(lw.as_str(), "fixed" | "scroll" | "local" | "text" | "none") {
+                    } else if lw == "fixed" {
+                        fixed = true;
+                    } else if lw == "text" {
+                        boxes.push(BoxArea::Text);
+                    } else if matches!(lw.as_str(), "scroll" | "local" | "none") {
                     } else if let Some(c) = css_color(&word, s.color) {
                         s.background = Some(c).filter(|c| c.3 > 0);
                     } else {
@@ -1376,6 +1384,7 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                     bg.repeats.push(rep);
                     bg.origins.push(boxes.first().copied().unwrap_or(BoxArea::Padding));
                     bg.clips.push(boxes.get(1).or(boxes.first()).copied().unwrap_or(BoxArea::Border));
+                    bg.fixed.push(fixed);
                 }
             }
             s.bg = (!bg.images.is_empty()).then(|| Rc::new(bg));
@@ -1405,7 +1414,16 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                 .collect()
         }
         "background-origin" => bg_mut(s).origins = crate::css::split_top_level(&lv, ',').filter_map(|l| box_area(l.trim())).collect(),
-        "background-clip" => bg_mut(s).clips = crate::css::split_top_level(&lv, ',').filter_map(|l| box_area(l.trim())).collect(),
+        "background-clip" | "-webkit-background-clip" => {
+            bg_mut(s).clips = crate::css::split_top_level(&lv, ',').filter_map(|l| if l.trim() == "text" { Some(BoxArea::Text) } else { box_area(l.trim()) }).collect()
+        }
+        "background-attachment" => bg_mut(s).fixed = crate::css::split_top_level(&lv, ',').map(|l| l.trim() == "fixed").collect(),
+        // the text color, over `color` (gradient text: `-webkit-text-fill-color: transparent`)
+        "-webkit-text-fill-color" => {
+            if let Some(c) = css_color(v, s.color) {
+                s.color = c;
+            }
+        }
         "counter-reset" => s.counter_reset = counter_list(&lv, 0),
         "counter-increment" => s.counter_increment = counter_list(&lv, 1),
         "counter-set" => s.counter_set = counter_list(&lv, 0),
@@ -1798,6 +1816,9 @@ mod tests {
         let bg = s.bg.clone().unwrap();
         assert_eq!(bg.images.len(), 2);
         assert_eq!((bg.origins.clone(), bg.clips.clone()), (vec![BoxArea::Content, BoxArea::Padding], vec![BoxArea::Content, BoxArea::Border]));
+        let s = computed("background: linear-gradient(red, blue) fixed; -webkit-background-clip: text");
+        let bg = s.bg.clone().unwrap();
+        assert_eq!((bg.clips.clone(), bg.fixed.clone()), (vec![BoxArea::Text], vec![true]));
         let s = computed("background-image: url(a.png), url(b.png), url(c.png); background-repeat: no-repeat, repeat");
         let bg = s.bg.clone().unwrap();
         assert_eq!(Background::nth(&bg.repeats, 2, (true, true)), (false, false));
