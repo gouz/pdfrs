@@ -1,0 +1,50 @@
+<style>
+  @page { size: A4; margin: 15mm }
+  :root { --accent: #2c6fbb; --soft: #eef4fb; --radius: 6px; }
+  body { font-family: "Segoe UI", sans-serif; color: #222 }
+  h1 { color: var(--accent); margin-bottom: 4px }
+  h2 { font-size: 13px; color: var(--accent); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 1px }
+  h2::before { content: "§ "; color: #aaa }
+  .row { display: flex; gap: 10px }
+  .swatch { flex: 1; height: 46px; border-radius: var(--radius); color: white; padding: 6px; font-size: 10px }
+  .lin { background: linear-gradient(90deg, #2c6fbb, #6bc1ff) }
+  .diag { background: linear-gradient(to bottom right, #ff7a59, #ffd36e) }
+  .rad { background: radial-gradient(circle at 30% 30%, #b18cff, #3b2a7a) }
+  .rep { background: repeating-linear-gradient(45deg, #444 0 6px, #666 6px 12px) }
+  .stamp { display: inline; }
+  .boxes { display: flex; gap: 30px; padding: 14px 10px }
+  .box { width: 70px; height: 40px; background: var(--soft); border: 1px solid var(--accent); text-align: center; font-size: 10px; padding-top: 12px; box-sizing: border-box }
+  .r1 { transform: rotate(-8deg) } .r2 { transform: scale(1.2) } .r3 { transform: skewX(-15deg) } .r4 { transform: translateY(8px) rotate(45deg) }
+  .calc { display: flex; gap: 10px } .calc div { width: calc(33.333% - 20px / 3); background: var(--soft); padding: 4px; flex-shrink: 0; font-size: 10px; box-sizing: border-box }
+  .price::before { content: "Total : "; color: #888 }
+  .price::after { content: " € TTC" }
+  a[href]::after { content: " (" attr(href) ")"; color: #888; font-size: 9px }
+  .warn { border-left: 4px solid #e67e22; background: #fdf2e9; padding: 6px 10px }
+  .warn::before { content: "⚠ Attention — "; font-weight: bold; color: #e67e22 }
+  @media (max-width: 400px) { .wide-only { display: none } }
+  @media print { .print-note { color: #2a9d5c } }
+  .rtl { direction: rtl; background: var(--soft); padding: 6px 10px }
+</style>
+<h1>Lot 1 : nouveautés CSS</h1>
+<p class="print-note">Ce texte est vert grâce à <code>@media print</code>, la page est réglée par <code>@page</code>.</p>
+
+<h2>Dégradés</h2>
+<div class="row">
+  <div class="swatch lin">linear 90deg</div><div class="swatch diag">to bottom right</div>
+  <div class="swatch rad">radial circle</div><div class="swatch rep">repeating</div>
+</div>
+
+<h2>Transform</h2>
+<div class="boxes"><div class="box r1">rotate</div><div class="box r2">scale</div><div class="box r3">skewX</div><div class="box r4">rotate 45°</div></div>
+
+<h2>calc() et var()</h2>
+<div class="calc"><div>calc(33.333% - 20px / 3)</div><div>trois colonnes</div><div>exactes</div></div>
+
+<h2>::before / ::after</h2>
+<p class="price">128,40</p>
+<p>Voir <a href="https://github.com/gouz/pdfrs">le dépôt</a>, et une citation : <q>simple et rapide</q>.</p>
+<p class="warn">le contenu généré prend le style de son pseudo-élément.</p>
+
+<h2>Droite à gauche</h2>
+<p class="rtl">שלום עולם — مرحبا بالعالم — 123 et du français</p>
+<ul dir="rtl"><li>פריט ראשון</li><li>عنصر ثاني</li></ul>

@@ -3,17 +3,42 @@
 
 use scraper::{ElementRef, Selector};
 
+#[derive(Clone, Debug)]
 pub struct Decl {
     pub prop: String,
     pub value: String,
     pub important: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pseudo {
+    Before,
+    After,
+}
+
 pub struct Rule {
     pub selector: Selector,
     /// (ids, classes/attributes/pseudo-classes, types), compared lexicographically
     pub specificity: (u16, u16, u16),
+    /// rule of `sel::before` / `sel::after`: matches `sel`, styles its generated content
+    pub pseudo: Option<Pseudo>,
     pub decls: Vec<Decl>,
+}
+
+/// What a stylesheet contributes: style rules, `@page` and `@font-face` declarations.
+#[derive(Default)]
+pub struct Sheet {
+    pub rules: Vec<Rule>,
+    pub pages: Vec<Vec<Decl>>,
+    pub font_faces: Vec<Vec<Decl>>,
+    pub has_pseudo: bool,
+}
+
+/// The medium @media queries are evaluated against: print, a page area of this size (pt).
+#[derive(Clone, Copy, Debug)]
+pub struct Media {
+    pub width: f32,
+    pub height: f32,
 }
 
 fn strip_comments(css: &str) -> String {
@@ -44,7 +69,7 @@ pub fn parse_declarations(css: &str) -> Vec<Decl> {
 }
 
 /// split on `sep` outside parentheses and quotes (`url(a;b)`, `"a;b"`)
-fn split_top_level(s: &str, sep: char) -> impl Iterator<Item = &str> {
+pub fn split_top_level(s: &str, sep: char) -> impl Iterator<Item = &str> {
     let mut parts = Vec::new();
     let (mut depth, mut quote, mut start) = (0i32, None, 0);
     for (i, c) in s.char_indices() {
@@ -65,20 +90,25 @@ fn split_top_level(s: &str, sep: char) -> impl Iterator<Item = &str> {
     parts.into_iter()
 }
 
-/// Rules of a stylesheet, in source order. At-rules (@media, @font-face, @page...) are skipped.
-pub fn parse_stylesheet(css: &str, rules: &mut Vec<Rule>) {
-    let css = strip_comments(css);
-    let mut rest = css.as_str();
+/// Rules of a stylesheet, in source order. `@media` blocks that match `media` are included,
+/// `@page` / `@font-face` collected, other at-rules (`@import`, `@keyframes`...) skipped.
+pub fn parse_stylesheet(css: &str, media: &Media, sheet: &mut Sheet) {
+    parse_block(&strip_comments(css), media, sheet, 0);
+}
+
+fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
+    let mut rest = css;
     while let Some(open) = rest.find('{') {
-        let prelude = rest[..open].trim();
+        // statements before the block (`@import url(x);`) are not part of the prelude
+        let prelude = rest[..open].rsplit(';').next().unwrap_or("").trim();
         // matching close brace (at-rules nest blocks)
-        let (mut depth, mut close) = (0, rest.len());
+        let (mut d, mut close) = (0, rest.len());
         for (i, c) in rest[open..].char_indices() {
             match c {
-                '{' => depth += 1,
+                '{' => d += 1,
                 '}' => {
-                    depth -= 1;
-                    if depth == 0 {
+                    d -= 1;
+                    if d == 0 {
                         close = open + i;
                         break;
                     }
@@ -88,7 +118,16 @@ pub fn parse_stylesheet(css: &str, rules: &mut Vec<Rule>) {
         }
         let body = &rest[open + 1..close.min(rest.len())];
         rest = rest.get(close + 1..).unwrap_or("");
-        if prelude.starts_with('@') {
+        if let Some(at) = prelude.strip_prefix('@') {
+            let (name, args) = at.split_once(|c: char| c.is_whitespace()).unwrap_or((at, ""));
+            match name.to_ascii_lowercase().as_str() {
+                "media" if depth < 8 && media_matches(args, media) => parse_block(body, media, sheet, depth + 1),
+                "supports" if depth < 8 => parse_block(body, media, sheet, depth + 1),
+                // `@page :first` / `:left` / named pages: only the default page is supported
+                "page" if args.trim().is_empty() => sheet.pages.push(parse_declarations(body)),
+                "font-face" => sheet.font_faces.push(parse_declarations(body)),
+                _ => {}
+            }
             continue;
         }
         let decls = parse_declarations(body);
@@ -98,11 +137,92 @@ pub fn parse_stylesheet(css: &str, rules: &mut Vec<Rule>) {
         // one rule per selector of the list: each has its own specificity
         for sel in split_top_level(prelude, ',') {
             let sel = sel.trim();
-            if let Ok(selector) = Selector::parse(sel) {
-                let decls = decls.iter().map(|d| Decl { prop: d.prop.clone(), value: d.value.clone(), important: d.important }).collect();
-                rules.push(Rule { selector, specificity: specificity(sel), decls });
+            let lower = sel.to_ascii_lowercase();
+            let (base, pseudo) = if let Some(b) = lower.strip_suffix("::before").or(lower.strip_suffix(":before")) {
+                (&sel[..b.len()], Some(Pseudo::Before))
+            } else if let Some(b) = lower.strip_suffix("::after").or(lower.strip_suffix(":after")) {
+                (&sel[..b.len()], Some(Pseudo::After))
+            } else if lower.contains("::") {
+                continue; // ::marker, ::first-line, ::placeholder...: not generated
+            } else {
+                (sel, None)
+            };
+            let base = if base.trim().is_empty() || base.ends_with(' ') || base.ends_with('>') { format!("{base}*") } else { base.to_string() };
+            if let Ok(selector) = Selector::parse(&base) {
+                let mut spec = specificity(&base);
+                if pseudo.is_some() {
+                    spec.2 += 1;
+                    sheet.has_pseudo = true;
+                }
+                sheet.rules.push(Rule { selector, specificity: spec, pseudo, decls: decls.clone() });
             }
         }
+    }
+}
+
+/// `print`, `screen and (min-width: 600px)`, `(orientation: landscape)`, `not print`, lists with commas.
+pub fn media_matches(query: &str, m: &Media) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    split_top_level(&q, ',').any(|one| {
+        let one = one.trim();
+        let (not, one) = match one.strip_prefix("not ") {
+            Some(rest) => (true, rest),
+            None => (false, one.strip_prefix("only ").unwrap_or(one)),
+        };
+        let mut ok = true;
+        for part in one.split(" and ") {
+            let part = part.trim();
+            ok &= if let Some(feature) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+                media_feature(feature.trim(), m)
+            } else {
+                matches!(part, "all" | "print" | "")
+            };
+        }
+        ok != not
+    })
+}
+
+fn media_feature(f: &str, m: &Media) -> bool {
+    let px = |v: &str| -> Option<f32> {
+        let v = v.trim();
+        let unit = v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len());
+        let n: f32 = v[..unit].trim().parse().ok()?;
+        Some(match &v[unit..] {
+            "em" | "rem" => n * 16.0,
+            "in" => n * 72.0,
+            "cm" => n * 72.0 / 2.54,
+            "mm" => n * 72.0 / 25.4,
+            _ => n,
+        })
+    };
+    // range syntax: `width >= 600px`
+    for op in [">=", "<=", ">", "<"] {
+        if let Some((name, v)) = f.split_once(op) {
+            let actual = if name.trim() == "width" { m.width } else if name.trim() == "height" { m.height } else { return false };
+            let Some(v) = px(v) else { return false };
+            return match op {
+                ">=" => actual >= v,
+                "<=" => actual <= v,
+                ">" => actual > v,
+                _ => actual < v,
+            };
+        }
+    }
+    let (name, value) = f.split_once(':').map_or((f, ""), |(a, b)| (a.trim(), b.trim()));
+    match name {
+        "min-width" => px(value).is_some_and(|v| m.width >= v),
+        "max-width" => px(value).is_some_and(|v| m.width <= v),
+        "width" => px(value).is_some_and(|v| (m.width - v).abs() < 0.5),
+        "min-height" => px(value).is_some_and(|v| m.height >= v),
+        "max-height" => px(value).is_some_and(|v| m.height <= v),
+        "orientation" => (value == "landscape") == (m.width > m.height),
+        "color" | "monochrome" | "hover" | "pointer" | "prefers-color-scheme" | "prefers-reduced-motion" => {
+            matches!((name, value), ("color", _) | ("prefers-color-scheme", "light") | ("prefers-reduced-motion", "reduce") | ("hover", "none") | ("pointer", "none"))
+        }
+        _ => false,
     }
 }
 
@@ -154,15 +274,16 @@ fn specificity(sel: &str) -> (u16, u16, u16) {
     (a, b, c)
 }
 
-/// Winning declarations for an element: sorted by (important, origin, specificity, source order),
-/// inline `style` beats every stylesheet rule. Later entries win.
-pub fn matched<'a>(el: ElementRef, ua: &'a [Rule], author: &'a [Rule], inline: &'a [Decl]) -> Vec<&'a Decl> {
+/// Winning declarations for an element (or its `::before` / `::after`): sorted by
+/// (important, origin, specificity, source order), inline `style` beats every stylesheet rule.
+/// Later entries win.
+pub fn matched<'a>(el: ElementRef, pseudo: Option<Pseudo>, ua: &'a [Rule], author: &'a [Rule], inline: &'a [Decl]) -> Vec<&'a Decl> {
     // (important, origin, specificity, order)
     let mut out: Vec<((bool, u8, (u16, u16, u16), usize), &Decl)> = Vec::new();
     let mut order = 0;
     for (origin, rules) in [(0u8, ua), (1, author)] {
         for rule in rules {
-            if rule.selector.matches(&el) {
+            if rule.pseudo == pseudo && rule.selector.matches(&el) {
                 for d in &rule.decls {
                     out.push(((d.important, origin, rule.specificity, order), d));
                     order += 1;
@@ -170,9 +291,11 @@ pub fn matched<'a>(el: ElementRef, ua: &'a [Rule], author: &'a [Rule], inline: &
             }
         }
     }
-    for d in inline {
-        out.push(((d.important, 2, (u16::MAX, 0, 0), order), d));
-        order += 1;
+    if pseudo.is_none() {
+        for d in inline {
+            out.push(((d.important, 2, (u16::MAX, 0, 0), order), d));
+            order += 1;
+        }
     }
     out.sort_by_key(|(k, _)| *k);
     out.into_iter().map(|(_, d)| d).collect()
@@ -190,13 +313,38 @@ mod tests {
         assert!(d[2].important && d[2].value == "0");
     }
 
+    const A4: Media = Media { width: 515.0, height: 762.0 };
+
     #[test]
-    fn stylesheet_skips_at_rules() {
-        let mut rules = Vec::new();
-        parse_stylesheet("/* c */ @media print { p { color: red } } h1, .a { color: blue } @font-face { x: y }", &mut rules);
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].specificity, (0, 0, 1));
-        assert_eq!(rules[1].specificity, (0, 1, 0));
+    fn at_rules() {
+        let mut s = Sheet::default();
+        parse_stylesheet(
+            "@import url(x.css); /* c */ @media print { p { color: red } } @media screen { p { color: blue } }
+             h1, .a { color: blue } @font-face { font-family: X; src: url(x.ttf) } @page { size: A5 } @page :first { margin: 0 }
+             @keyframes k { from { color: red } } p::before { content: 'x' } li:after { content: '' } ::marker { color: red }",
+            &A4,
+            &mut s,
+        );
+        assert_eq!(s.rules.len(), 5); // p (print), h1, .a, p::before, li::after
+        assert_eq!(s.rules[1].specificity, (0, 0, 1));
+        assert_eq!(s.rules[2].specificity, (0, 1, 0));
+        assert_eq!(s.rules[3].pseudo, Some(Pseudo::Before));
+        assert_eq!(s.rules[4].pseudo, Some(Pseudo::After));
+        assert!(s.has_pseudo);
+        assert_eq!((s.pages.len(), s.font_faces.len()), (1, 1));
+    }
+
+    #[test]
+    fn media_queries() {
+        assert!(media_matches("print", &A4));
+        assert!(media_matches("all and (min-width: 400px)", &A4));
+        assert!(!media_matches("screen", &A4));
+        assert!(media_matches("not screen", &A4));
+        assert!(media_matches("screen, print", &A4));
+        assert!(!media_matches("(max-width: 400px)", &A4));
+        assert!(media_matches("(width >= 500px)", &A4));
+        assert!(media_matches("(orientation: portrait)", &A4));
+        assert!(!media_matches("(min-resolution: 2dppx)", &A4));
     }
 
     #[test]

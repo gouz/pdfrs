@@ -5,11 +5,11 @@
 //! (they are moved to the next page); boxes that span a cut are drawn on both pages, clipped.
 
 use crate::layout::{Brush, Deco, ImageKind, ImageLeaf, Leaf, TextLeaf, Tree};
-use crate::style::{BorderStyle, ObjectFit, Rgba};
+use crate::style::{self, BorderStyle, Gradient, GradientKind, Len, ObjectFit, Rgba};
 use krilla::color::rgb;
 use krilla::geom::{Path, PathBuilder, Point, Rect, Size, Transform};
 use krilla::num::NormalizedF32;
-use krilla::paint::{Fill, FillRule, LineCap, Stroke, StrokeDash};
+use krilla::paint::{Fill, FillRule, LineCap, LinearGradient, Paint, RadialGradient, SpreadMethod, Stop, Stroke, StrokeDash};
 use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph};
 use krilla_svg::{SurfaceExt, SvgSettings};
@@ -106,10 +106,13 @@ pub fn paginate(page: f32, breaks: &Breaks) -> Vec<(f32, f32)> {
 thread_local! {
     /// krilla fonts by (blob id, face index): parsed once per thread
     static FONTS: RefCell<HashMap<(u64, u32), Option<Font>>> = RefCell::new(HashMap::new());
+    /// the same for the @font-face fonts of the document being rendered, dropped after it
+    static DOC_FONTS: RefCell<HashMap<(u64, u32), Option<Font>>> = RefCell::new(HashMap::new());
 }
 
 fn krilla_font(f: &parley::FontData) -> Option<Font> {
-    FONTS.with(|c| {
+    let cache = if crate::fonts::registry().is_shared(f.data.id()) { &FONTS } else { &DOC_FONTS };
+    cache.with(|c| {
         c.borrow_mut()
             .entry((f.data.id(), f.index))
             .or_insert_with(|| {
@@ -118,6 +121,129 @@ fn krilla_font(f: &parley::FontData) -> Option<Font> {
             })
             .clone()
     })
+}
+
+/// Forget the fonts of the document just rendered (its @font-face).
+pub fn end_document() {
+    DOC_FONTS.with(|c| c.borrow_mut().clear());
+}
+
+/// Stop offsets along a gradient line of `length`: missing positions spread evenly, never decreasing.
+fn stop_offsets(stops: &[(Rgba, Option<Len>)], length: f32) -> Vec<(Rgba, f32)> {
+    let n = stops.len();
+    let mut pos: Vec<Option<f32>> = stops.iter().map(|(_, p)| p.map(|p| style::resolve(p, length) / length.max(0.001))).collect();
+    if pos[0].is_none() {
+        pos[0] = Some(0.0);
+    }
+    if pos[n - 1].is_none() {
+        pos[n - 1] = Some(1.0);
+    }
+    let mut i = 0;
+    while i < n {
+        if pos[i].is_none() {
+            let (a, prev) = (i - 1, pos[i - 1].unwrap());
+            let b = (i..n).find(|&j| pos[j].is_some()).unwrap();
+            let next = pos[b].unwrap();
+            for (k, slot) in pos.iter_mut().enumerate().take(b).skip(i) {
+                *slot = Some(prev + (next - prev) * (k - a) as f32 / (b - a) as f32);
+            }
+            i = b;
+        }
+        i += 1;
+    }
+    let mut last = f32::NEG_INFINITY;
+    stops.iter().zip(pos).map(|((c, _), p)| {
+        last = p.unwrap().max(last);
+        (*c, last)
+    }).collect()
+}
+
+fn krilla_stops(stops: &[(Rgba, f32)]) -> Vec<Stop> {
+    stops
+        .iter()
+        .map(|(c, o)| Stop {
+            offset: NormalizedF32::new(o.clamp(0.0, 1.0)).unwrap_or(NormalizedF32::ONE),
+            color: rgb::Color::new(c.0, c.1, c.2).into(),
+            opacity: NormalizedF32::new(c.3 as f32 / 255.0).unwrap_or(NormalizedF32::ONE),
+        })
+        .collect()
+}
+
+/// A repeating gradient repeats the span of its stops: the line is shortened to it, offsets rescaled.
+fn repeat_span(offsets: &mut [(Rgba, f32)], repeating: bool) -> (f32, f32, SpreadMethod) {
+    let (first, last) = (offsets[0].1, offsets[offsets.len() - 1].1);
+    if !repeating || last - first <= 0.0001 {
+        return (0.0, 1.0, SpreadMethod::Pad);
+    }
+    for o in offsets.iter_mut() {
+        o.1 = (o.1 - first) / (last - first);
+    }
+    (first, last, SpreadMethod::Repeat)
+}
+
+fn gradient_paint(g: &Gradient, x: f32, y: f32, w: f32, h: f32) -> Option<Paint> {
+    match g.kind {
+        GradientKind::Linear(_) | GradientKind::LinearCorner(..) => {
+            let a = match g.kind {
+                GradientKind::Linear(deg) => deg.to_radians(),
+                // the 50% line goes through the two other corners
+                GradientKind::LinearCorner(sx, sy) => (sx as f32 * h).atan2(-(sy as f32) * w),
+                _ => unreachable!(),
+            };
+            let (dx, dy) = (a.sin(), -a.cos());
+            let len = (w * a.sin()).abs() + (h * a.cos()).abs();
+            let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+            let mut offsets = stop_offsets(&g.stops, len);
+            let (from, to, spread) = repeat_span(&mut offsets, g.repeating);
+            let start = (cx - dx * len / 2.0, cy - dy * len / 2.0);
+            Some(
+                LinearGradient {
+                    x1: start.0 + dx * len * from,
+                    y1: start.1 + dy * len * from,
+                    x2: start.0 + dx * len * to,
+                    y2: start.1 + dy * len * to,
+                    transform: Transform::identity(),
+                    spread_method: spread,
+                    stops: krilla_stops(&offsets),
+                    anti_alias: false,
+                }
+                .into(),
+            )
+        }
+        GradientKind::Radial { circle, at } => {
+            let (cx, cy) = (x + style::resolve(at.0, w), y + style::resolve(at.1, h));
+            // farthest-corner
+            let (fx, fy) = ((cx - x).max(x + w - cx), (cy - y).max(y + h - cy));
+            let (rx, ry) = if circle {
+                let r = fx.hypot(fy);
+                (r, r)
+            } else {
+                (fx * std::f32::consts::SQRT_2, fy * std::f32::consts::SQRT_2)
+            };
+            if rx <= 0.0 || ry <= 0.0 {
+                return None;
+            }
+            let mut offsets = stop_offsets(&g.stops, rx);
+            let (from, to, spread) = repeat_span(&mut offsets, g.repeating);
+            let k = ry / rx;
+            Some(
+                RadialGradient {
+                    fx: cx,
+                    fy: cy,
+                    fr: rx * from,
+                    cx,
+                    cy,
+                    cr: rx * to,
+                    // ellipse: the circle squashed vertically around the center
+                    transform: Transform::from_row(1.0, 0.0, 0.0, k, 0.0, cy * (1.0 - k)),
+                    spread_method: spread,
+                    stops: krilla_stops(&offsets),
+                    anti_alias: false,
+                }
+                .into(),
+            )
+        }
+    }
 }
 
 fn fill(c: Rgba) -> Fill {
@@ -183,6 +309,13 @@ fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32) {
         if let Some(p) = rounded_path(x, y, w, h, d.radius) {
             s.set_stroke(None);
             s.set_fill(Some(fill(bg)));
+            s.draw_path(&p);
+        }
+    }
+    if let Some(paint) = d.gradient.as_deref().and_then(|g| gradient_paint(g, x, y, w, h)) {
+        if let Some(p) = rounded_path(x, y, w, h, d.radius) {
+            s.set_stroke(None);
+            s.set_fill(Some(Fill { paint, opacity: NormalizedF32::ONE, rule: FillRule::NonZero }));
             s.draw_path(&p);
         }
     }
@@ -380,6 +513,17 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
         if d.opacity < 1.0 {
             s.push_opacity(NormalizedF32::new(d.opacity).unwrap_or(NormalizedF32::ONE));
             pushed += 1;
+        }
+        // transform around transform-origin (default: the center of the border box)
+        if let Some((t, origin, em)) = &d.transform {
+            if let Some(m) = style::transform_matrix(t, w, h, *em) {
+                let (ox, oy) = origin.as_deref().map_or((Len::Pct(50.0), Len::Pct(50.0)), |o| style::position(o, *em, *em));
+                let (ox, oy) = (x + style::resolve(ox, w), y + style::resolve(oy, h));
+                s.push_transform(&Transform::from_translate(ox, oy));
+                s.push_transform(&Transform::from_row(m[0], m[1], m[2], m[3], m[4], m[5]));
+                s.push_transform(&Transform::from_translate(-ox, -oy));
+                pushed += 3;
+            }
         }
         if y < window.1 && y + h > window.0 {
             draw_box(s, d, x, y, w, h);

@@ -5,7 +5,7 @@
 //! Helvetica/Arial/sans-serif -> Liberation Sans, Times/serif -> Liberation Serif,
 //! Courier/monospace -> Liberation Mono. DejaVu Sans is the last-resort fallback for missing glyphs.
 
-use parley::fontique::{Blob, Collection, CollectionOptions};
+use parley::fontique::{Blob, Collection, CollectionOptions, FontInfoOverride, FontStyle, FontWeight};
 use parley::FontContext;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 pub struct Registry {
     blobs: Vec<Blob<u8>>,
+    blob_ids: std::collections::HashSet<u64>,
     /// lowercase family name -> family name as registered
     families: HashMap<String, String>,
     /// generic -> registered family
@@ -83,13 +84,22 @@ pub fn init(dirs: &[PathBuf]) -> usize {
     }
     let fallback = pick(FALLBACK);
     let n = files.len();
-    let _ = REGISTRY.set(Registry { blobs, families, aliases, fallback, svg_fonts: Arc::new(svg) });
+    let blob_ids = blobs.iter().map(|b| b.id()).collect();
+    let _ = REGISTRY.set(Registry { blobs, blob_ids, families, aliases, fallback, svg_fonts: Arc::new(svg) });
     n
+}
+
+impl Registry {
+    /// a font of the font directories (shared by every document), not a document's @font-face
+    pub fn is_shared(&self, blob_id: u64) -> bool {
+        self.blob_ids.contains(&blob_id)
+    }
 }
 
 pub fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| Registry {
         blobs: Vec::new(),
+        blob_ids: Default::default(),
         families: HashMap::new(),
         aliases: HashMap::new(),
         fallback: None,
@@ -109,15 +119,59 @@ pub fn init_for_tests() {
 /// None when no family is usable: the declaration is then ignored (the parent's family is inherited).
 pub fn resolve_stack(stack: &str) -> Option<String> {
     let r = registry();
-    stack.replace("&quot;", "").split(',').find_map(|name| {
-        let name = name.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_lowercase();
-        let family = r.families.get(&name).or_else(|| r.aliases.get(name.as_str()))?;
-        Some(format!("\"{family}\""))
+    DOC_FAMILIES.with(|doc| {
+        let doc = doc.borrow();
+        stack.replace("&quot;", "").split(',').find_map(|name| {
+            let name = name.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_lowercase();
+            let family = doc.get(&name).or_else(|| r.families.get(&name)).or_else(|| r.aliases.get(name.as_str()))?;
+            Some(format!("\"{family}\""))
+        })
     })
 }
 
 thread_local! {
     static FONT_CX: RefCell<Option<FontContext>> = const { RefCell::new(None) };
+    /// @font-face families of the document being built on this thread (lowercase -> name)
+    static DOC_FAMILIES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+/// A `@font-face` of a document, loaded.
+#[derive(Clone)]
+pub struct DocFace {
+    pub family: String,
+    pub data: Blob<u8>,
+    pub weight: Option<f32>,
+    pub italic: bool,
+}
+
+/// sfnt data (TrueType / OpenType / collection)? WOFF / WOFF2 are not decoded.
+pub fn is_sfnt(data: &[u8]) -> bool {
+    matches!(data.get(..4), Some(b"\0\x01\0\0" | b"OTTO" | b"true" | b"ttcf"))
+}
+
+/// Like with_font_cx, plus the document's @font-face fonts, visible to this call only:
+/// they go into a copy of the thread's FontContext, never into the shared one.
+pub fn with_doc_font_cx<R>(faces: &[DocFace], f: impl FnOnce(&mut FontContext) -> R) -> R {
+    if faces.is_empty() {
+        return with_font_cx(f);
+    }
+    let mut fcx = with_font_cx(|base| base.clone());
+    DOC_FAMILIES.with(|doc| {
+        let mut doc = doc.borrow_mut();
+        for face in faces {
+            let o = FontInfoOverride {
+                family_name: Some(&face.family),
+                weight: face.weight.map(FontWeight::new),
+                style: face.italic.then_some(FontStyle::Italic),
+                ..Default::default()
+            };
+            fcx.collection.register_fonts(face.data.clone(), Some(o));
+            doc.insert(face.family.to_lowercase(), face.family.clone());
+        }
+    });
+    let r = f(&mut fcx);
+    DOC_FAMILIES.with(|doc| doc.borrow_mut().clear());
+    r
 }
 
 /// The thread's FontContext, built on first use from the shared font blobs.

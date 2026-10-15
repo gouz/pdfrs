@@ -1,9 +1,9 @@
 //! DOM + computed styles -> taffy box tree (block, flex, grid; tables as grids) with parley text leaves.
 
-use crate::css::{self, Rule};
+use crate::css::{self, Decl, Media, Pseudo, Rule, Sheet};
 use crate::fonts;
 use crate::images::{self, ImagePolicy};
-use crate::style::{self, BorderStyle, Display, Len, ObjectFit, Rgba, Style, TextAlign, Transform, VAlign, WhiteSpace};
+use crate::style::{self, BorderStyle, Display, Gradient, Len, ObjectFit, Rgba, Style, TextAlign, Transform, VAlign, WhiteSpace};
 use ego_tree::NodeRef;
 use parley::{FontContext, LayoutContext, StyleProperty, TextStyle};
 use scraper::{ElementRef, Html, Node};
@@ -54,12 +54,16 @@ a { color: #0000ee; text-decoration: underline }
 hr { border-top: 1px solid #888; margin: 0.5em 0 }
 center { text-align: center }
 img { object-fit: contain }
+[dir=rtl i] { direction: rtl }
+[dir=ltr i] { direction: ltr }
+q::before { content: open-quote }
+q::after { content: close-quote }
 "#;
 
 static UA: LazyLock<Vec<Rule>> = LazyLock::new(|| {
-    let mut rules = Vec::new();
-    css::parse_stylesheet(UA_CSS, &mut rules);
-    rules
+    let mut sheet = Sheet::default();
+    css::parse_stylesheet(UA_CSS, &Media { width: 0.0, height: 0.0 }, &mut sheet);
+    sheet.rules
 });
 
 /// Text paint and the inline box it belongs to (link index, background).
@@ -107,6 +111,39 @@ pub struct Deco {
     pub break_before: bool,
     pub break_after: bool,
     pub avoid_break_inside: bool,
+    pub gradient: Option<Rc<Gradient>>,
+    /// `transform`, `transform-origin`, font size (for em units)
+    pub transform: Option<(Rc<str>, Option<Rc<str>>, f32)>,
+}
+
+impl Deco {
+    /// anything to draw or to take into account when paginating
+    fn needed(&self) -> bool {
+        self.background.is_some()
+            || self.gradient.is_some()
+            || self.border_width.iter().any(|w| *w > 0.0)
+            || self.opacity < 1.0
+            || self.clip
+            || self.transform.is_some()
+            || self.break_before
+            || self.break_after
+            || self.avoid_break_inside
+    }
+}
+
+/// A style length given as `calc(px + pct%)`, fixed up once the containing block is known.
+#[derive(Clone, Copy, Debug)]
+enum CalcField {
+    Width,
+    Height,
+    MinWidth,
+    MinHeight,
+    MaxWidth,
+    MaxHeight,
+    Margin(usize),
+    Padding(usize),
+    Inset(usize),
+    FlexBasis,
 }
 
 pub struct Tree {
@@ -114,6 +151,7 @@ pub struct Tree {
     pub root: NodeId,
     pub deco: HashMap<NodeId, Deco>,
     pub links: Vec<String>,
+    calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
 }
 
 enum Piece {
@@ -128,7 +166,7 @@ struct Ctx {
 }
 
 struct Builder<'a> {
-    author: Vec<Rule>,
+    sheet: &'a Sheet,
     rem: f32,
     policy: &'a ImagePolicy,
     taffy: TaffyTree<Leaf>,
@@ -141,23 +179,79 @@ struct Builder<'a> {
     /// nesting of boxes and of walk() calls: bounded, so hostile HTML cannot overflow the stack
     box_depth: usize,
     walk_depth: usize,
+    calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
 }
 
 /// Deeper boxes are flattened into their ancestor; deeper inline content is dropped.
 const MAX_BOX_DEPTH: usize = 100;
 const MAX_WALK_DEPTH: usize = 400;
 
-/// Build the box tree of `html`, the root (<body>) being a block of `width` pt.
-pub fn build(html: &str, policy: &ImagePolicy, font: &str, font_size: f32, width: f32, lcx: &mut LayoutContext<Brush>) -> Tree {
-    let doc = Html::parse_document(html);
-    let mut author = Vec::new();
+/// The <style> sheets of a document, for a given medium.
+pub fn stylesheet(doc: &Html, media: &Media) -> Sheet {
+    let mut sheet = Sheet::default();
     let style_sel = scraper::Selector::parse("style").unwrap();
     for s in doc.select(&style_sel) {
-        css::parse_stylesheet(&s.text().collect::<String>(), &mut author);
+        if s.value().attr("media").is_none_or(|m| css::media_matches(m, media)) {
+            css::parse_stylesheet(&s.text().collect::<String>(), media, &mut sheet);
+        }
     }
-    fonts::with_font_cx(|fcx| {
+    sheet
+}
+
+/// Load the @font-face fonts a sheet declares: `data:` URLs, or files of the image directory.
+/// TrueType / OpenType only (WOFF and WOFF2 are skipped with a warning).
+pub fn load_font_faces(faces: &[Vec<Decl>], policy: &ImagePolicy) -> Vec<fonts::DocFace> {
+    let mut out = Vec::new();
+    for decls in faces {
+        let get = |p: &str| decls.iter().rev().find(|d| d.prop == p).map(|d| d.value.as_str());
+        let Some(family) = get("font-family").map(|f| f.trim().trim_matches(|c| c == '"' || c == '\'').to_string()).filter(|f| !f.is_empty()) else {
+            continue;
+        };
+        let weight = get("font-weight").and_then(|w| match w.split_whitespace().next()? {
+            "normal" => Some(400.0),
+            "bold" => Some(700.0),
+            n => n.parse().ok(),
+        });
+        let italic = get("font-style").is_some_and(|s| s.contains("italic") || s.contains("oblique"));
+        let srcs = get("src").unwrap_or("");
+        let data = css::split_top_level(srcs, ',').find_map(|src| {
+            let src = src.trim();
+            let url = src.find("url(").map(|i| &src[i + 4..])?;
+            let url = url[..url.find(')')?].trim().trim_matches(|c| c == '"' || c == '\'');
+            let data = if url.to_ascii_lowercase().starts_with("data:") {
+                let (meta, body) = url.split_once(',')?;
+                if !meta.to_ascii_lowercase().ends_with(";base64") {
+                    return None;
+                }
+                use base64::Engine;
+                let clean: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+                base64::engine::general_purpose::STANDARD.decode(clean).ok()?
+            } else {
+                match images::resolve(url, policy)? {
+                    images::Source::File(f) => std::fs::read(f).ok()?,
+                    images::Source::Data(d) => d,
+                }
+            };
+            if fonts::is_sfnt(&data) {
+                Some(data)
+            } else {
+                eprintln!("pdfrs: @font-face {family:?}: only TrueType / OpenType fonts are supported (not WOFF / WOFF2)");
+                None
+            }
+        });
+        if let Some(data) = data {
+            out.push(fonts::DocFace { family, data: parley::fontique::Blob::new(Arc::new(data)), weight, italic });
+        }
+    }
+    out
+}
+
+/// Build the box tree of a document, the root (<body>) being a block of `width` pt.
+#[allow(clippy::too_many_arguments)]
+pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &ImagePolicy, font: &str, font_size: f32, width: f32, lcx: &mut LayoutContext<Brush>) -> Tree {
+    fonts::with_doc_font_cx(faces, |fcx| {
         let mut b = Builder {
-            author,
+            sheet,
             rem: font_size,
             policy,
             taffy: TaffyTree::new(),
@@ -168,6 +262,7 @@ pub fn build(html: &str, policy: &ImagePolicy, font: &str, font_size: f32, width
             counters: Vec::new(),
             box_depth: 0,
             walk_depth: 0,
+            calc: Vec::new(),
         };
         b.taffy.disable_rounding();
         let base = Rc::new(Style::root(font, font_size));
@@ -181,8 +276,9 @@ pub fn build(html: &str, policy: &ImagePolicy, font: &str, font_size: f32, width
         body_style.display = Display::Block;
         body_style.size[0] = Len::Px(width);
         body_style.background = body_style.background.or(html_style.background);
+        body_style.gradient = body_style.gradient.clone().or(html_style.gradient.clone());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc }
     })
 }
 
@@ -324,6 +420,7 @@ fn to_taffy(s: &Style) -> taffy::Style {
         justify_self: s.justify_self,
         gap: taffy::Size { width: s.gap[1].lp(), height: s.gap[0].lp() },
         aspect_ratio: s.aspect_ratio,
+        direction: if s.rtl { taffy::Direction::Rtl } else { taffy::Direction::Ltr },
         ..Default::default()
     };
     if let Some(cols) = s.grid_template_columns.as_deref().and_then(|v| v.parse::<taffy::GridTemplateTracks<String, taffy::GridTemplateComponent<String>>>().ok()) {
@@ -369,13 +466,37 @@ fn deco_of(s: &Style) -> Deco {
         break_before: s.break_before,
         break_after: s.break_after,
         avoid_break_inside: s.break_inside_avoid,
+        gradient: s.gradient.clone(),
+        transform: s.transform_fn.clone().map(|t| (t, s.transform_origin.clone(), s.font_size)),
     }
+}
+
+fn calc_fields(s: &Style) -> Vec<(CalcField, f32, f32)> {
+    let mut out = Vec::new();
+    let mut add = |f, l: Len| {
+        if let Len::Calc(px, pct) = l {
+            out.push((f, px, pct));
+        }
+    };
+    add(CalcField::Width, s.size[0]);
+    add(CalcField::Height, s.size[1]);
+    add(CalcField::MinWidth, s.min_size[0]);
+    add(CalcField::MinHeight, s.min_size[1]);
+    add(CalcField::MaxWidth, s.max_size[0]);
+    add(CalcField::MaxHeight, s.max_size[1]);
+    add(CalcField::FlexBasis, s.flex_basis);
+    for i in 0..4 {
+        add(CalcField::Margin(i), s.margin[i]);
+        add(CalcField::Padding(i), s.padding[i]);
+        add(CalcField::Inset(i), s.inset[i]);
+    }
+    out
 }
 
 impl Builder<'_> {
     fn style_of(&self, el: ElementRef, parent: &Style) -> Style {
         let inline = attr(&el, "style").map(css::parse_declarations).unwrap_or_default();
-        let decls = css::matched(el, &UA, &self.author, &inline);
+        let decls = css::matched(el, None, &UA, &self.sheet.rules, &inline);
         let mut s = Style::compute(parent, &decls, self.rem);
         // presentational attributes
         if let Some(align) = attr(&el, "align") {
@@ -394,7 +515,54 @@ impl Builder<'_> {
         s
     }
 
+    /// Decoration and calc() fix-ups of a new element node.
+    fn finish_node(&mut self, node: NodeId, s: &Style) {
+        let d = deco_of(s);
+        if d.needed() {
+            self.deco.insert(node, d);
+        }
+        let calc = calc_fields(s);
+        if !calc.is_empty() {
+            self.calc.push((node, calc));
+        }
+    }
+
+    /// `::before` / `::after` content of `el`: inline text in the current group, or its own box.
+    fn pseudo(&mut self, el: ElementRef, s: &Rc<Style>, which: Pseudo, brush: &Brush, ctx: &mut Ctx, container: &Rc<Style>) {
+        if !self.sheet.has_pseudo && el.value().name() != "q" {
+            return;
+        }
+        let decls = css::matched(el, Some(which), &UA, &self.sheet.rules, &[]);
+        if decls.is_empty() {
+            return;
+        }
+        let ps = Style::compute(s, &decls, self.rem);
+        let Some(text) = ps.content.as_deref().and_then(|c| style::content(c, |a| attr(&el, a).map(String::from))) else { return };
+        let text = apply_transform(&text, ps.transform);
+        let ps = Rc::new(ps);
+        match ps.display {
+            Display::None => {}
+            Display::Inline | Display::Contents => {
+                let b = Brush { color: ps.color, background: ps.background.or(brush.background), link: brush.link };
+                ctx.group.push(Piece::Text(text, ps.clone(), b));
+            }
+            _ => {
+                self.flush(ctx, container);
+                let mut inner = Ctx::default();
+                if !text.is_empty() {
+                    inner.group.push(Piece::Text(text, ps.clone(), brush_of(&ps)));
+                    self.flush(&mut inner, &ps);
+                }
+                if let Ok(node) = self.taffy.new_with_children(to_taffy(&ps), &inner.children) {
+                    self.finish_node(node, &ps);
+                    ctx.children.push(node);
+                }
+            }
+        }
+    }
+
     /// An element box (block / flex / grid / list item / table / cell) and its content.
+
     fn build_box(&mut self, el: ElementRef, s: Rc<Style>) -> Option<NodeId> {
         if s.display == Display::Table {
             return self.build_table(el, s);
@@ -424,8 +592,16 @@ impl Builder<'_> {
                         leaf,
                         taffy::Style {
                             position: taffy::Position::Absolute,
-                            inset: taffy::Rect { top: LengthPercentageAuto::length(0.0), right: LengthPercentageAuto::percent(1.0), bottom: auto(), left: auto() },
-                            margin: taffy::Rect { right: LengthPercentageAuto::length(s.font_size * 0.5), ..taffy::Rect::zero() },
+                            inset: if s.rtl {
+                                taffy::Rect { top: LengthPercentageAuto::length(0.0), left: LengthPercentageAuto::percent(1.0), bottom: auto(), right: auto() }
+                            } else {
+                                taffy::Rect { top: LengthPercentageAuto::length(0.0), right: LengthPercentageAuto::percent(1.0), bottom: auto(), left: auto() }
+                            },
+                            margin: if s.rtl {
+                                taffy::Rect { left: LengthPercentageAuto::length(s.font_size * 0.5), ..taffy::Rect::zero() }
+                            } else {
+                                taffy::Rect { right: LengthPercentageAuto::length(s.font_size * 0.5), ..taffy::Rect::zero() }
+                            },
                             ..Default::default()
                         },
                     );
@@ -433,7 +609,10 @@ impl Builder<'_> {
                 }
             }
         }
-        self.walk(*el, &s, brush_of(&s), &mut ctx, &s);
+        let brush = brush_of(&s);
+        self.pseudo(el, &s, Pseudo::Before, &brush, &mut ctx, &s);
+        self.walk(*el, &s, brush.clone(), &mut ctx, &s);
+        self.pseudo(el, &s, Pseudo::After, &brush, &mut ctx, &s);
         self.flush(&mut ctx, &s);
         if is_list {
             self.counters.pop();
@@ -450,10 +629,7 @@ impl Builder<'_> {
             };
         }
         let node = self.taffy.new_with_children(ts, &ctx.children).ok()?;
-        let d = deco_of(&s);
-        if d.background.is_some() || d.border_width.iter().any(|w| *w > 0.0) || d.opacity < 1.0 || d.clip || d.break_before || d.break_after || d.avoid_break_inside {
-            self.deco.insert(node, d);
-        }
+        self.finish_node(node, &s);
         Some(node)
     }
 
@@ -507,7 +683,9 @@ impl Builder<'_> {
                                     b.link = self.links.len() as u32;
                                 }
                             }
-                            self.walk(*el, &cs, b, ctx, container);
+                            self.pseudo(el, &cs, Pseudo::Before, &b, ctx, container);
+                            self.walk(*el, &cs, b.clone(), ctx, container);
+                            self.pseudo(el, &cs, Pseudo::After, &b, ctx, container);
                         }
                         _ if self.box_depth >= MAX_BOX_DEPTH => self.walk(*el, &cs, brush.clone(), ctx, container),
                         _ => {
@@ -543,6 +721,9 @@ impl Builder<'_> {
         }
         let root = text_style(container, brush_of(container));
         let mut b = self.lcx.tree_builder(self.fcx, 1.0, true, &root);
+        if container.rtl {
+            b.set_base_direction(parley::BaseDirection::Rtl);
+        }
         for p in &group {
             match p {
                 Piece::Text(t, s, brush) => {
@@ -612,10 +793,7 @@ impl Builder<'_> {
         }
         let fit = if el.value().name() == "svg" { ObjectFit::Contain } else { s.object_fit };
         let node = self.taffy.new_leaf_with_context(ts, Leaf::Image(ImageLeaf { kind, natural, fit, radius: s.radius })).ok()?;
-        let d = deco_of(&s);
-        if d.background.is_some() || d.border_width.iter().any(|w| *w > 0.0) || d.opacity < 1.0 {
-            self.deco.insert(node, Deco { radius: [0.0; 4], ..d });
-        }
+        self.finish_node(node, &s);
         Some(node)
     }
 
@@ -694,10 +872,7 @@ impl Builder<'_> {
             ts.justify_content = JustifyContent::START;
         }
         let node = self.taffy.new_with_children(ts, &children).ok()?;
-        let d = deco_of(&s);
-        if d.background.is_some() || d.border_width.iter().any(|w| *w > 0.0) || d.opacity < 1.0 || d.break_before || d.break_after || d.avoid_break_inside {
-            self.deco.insert(node, d);
-        }
+        self.finish_node(node, &s);
         Some(node)
     }
 
@@ -753,6 +928,15 @@ fn svg_tree(markup: &str) -> Option<usvg::Tree> {
     usvg::Tree::from_str(markup, &opts).ok()
 }
 
+fn side_mut<T>(r: &mut taffy::Rect<T>, i: usize) -> &mut T {
+    match i {
+        0 => &mut r.top,
+        1 => &mut r.right,
+        2 => &mut r.bottom,
+        _ => &mut r.left,
+    }
+}
+
 /// Measure a leaf: text wraps at the available width, images keep their aspect ratio.
 pub fn measure(inputs: taffy::LayoutInput, leaf: Option<&mut Leaf>, style: &taffy::Style) -> taffy::LayoutOutput {
     taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| match leaf {
@@ -787,13 +971,51 @@ pub fn measure(inputs: taffy::LayoutInput, leaf: Option<&mut Leaf>, style: &taff
 }
 
 impl Tree {
+    /// Resolve calc() lengths against their parent's content box; true if a style changed.
+    fn fix_calc(&mut self) -> bool {
+        let mut changed = false;
+        for (node, fields) in &self.calc {
+            let Some(parent) = self.taffy.parent(*node) else { continue };
+            let Ok(pl) = self.taffy.layout(parent) else { continue };
+            let (bw, bh) = (pl.content_box_width(), pl.content_box_height());
+            let Ok(mut st) = self.taffy.style(*node).cloned() else { continue };
+            let before = st.clone();
+            for &(f, px, pct) in fields {
+                let w = px + bw * pct / 100.0;
+                let h = px + bh * pct / 100.0;
+                match f {
+                    CalcField::Width => st.size.width = Dimension::length(w),
+                    CalcField::Height => st.size.height = Dimension::length(h),
+                    CalcField::MinWidth => st.min_size.width = LengthPercentageAuto::length(w),
+                    CalcField::MinHeight => st.min_size.height = LengthPercentageAuto::length(h),
+                    CalcField::MaxWidth => st.max_size.width = LengthPercentageAuto::length(w),
+                    CalcField::MaxHeight => st.max_size.height = LengthPercentageAuto::length(h),
+                    CalcField::FlexBasis => st.flex_basis = Dimension::length(w),
+                    // margins and paddings are relative to the width, on every side
+                    CalcField::Margin(i) => *side_mut(&mut st.margin, i) = LengthPercentageAuto::length(w),
+                    CalcField::Padding(i) => *side_mut(&mut st.padding, i) = LengthPercentage::length(w),
+                    CalcField::Inset(i) => *side_mut(&mut st.inset, i) = LengthPercentageAuto::length(if i % 2 == 0 { h } else { w }),
+                }
+            }
+            if st != before {
+                let _ = self.taffy.set_style(*node, st);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Lay the tree out and set every text leaf's final line breaks and alignment.
     pub fn compute(&mut self, width: f32) {
-        let _ = self.taffy.compute_layout_with_measure(
-            self.root,
-            Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent },
-            |inputs, _, leaf, style| measure(inputs, leaf, style),
-        );
+        let space = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
+        let _ = self.taffy.compute_layout_with_measure(self.root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+        // calc(px + pct%): resolve against the containing block just laid out, then lay out again
+        for _ in 0..3 {
+            if !self.fix_calc() {
+                break;
+            }
+            let _ = self.taffy.compute_layout_with_measure(self.root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+        }
         let mut stack = vec![self.root];
         while let Some(n) = stack.pop() {
             stack.extend(self.taffy.children(n).unwrap_or_default());

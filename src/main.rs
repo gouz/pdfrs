@@ -75,13 +75,13 @@ fn margin(v: &serde_json::Value) -> Result<[f32; 4], String> {
 fn options(p: Params, images: ImagePolicy) -> Result<Options, String> {
     let mut o = Options { images, ..Options::default() };
     if let Some(s) = p.size {
-        o.size = page_size(&s).ok_or(format!("size: unknown page size {s:?} (A4, LETTER... or 400x600)"))?;
+        o.size = Some(page_size(&s).ok_or(format!("size: unknown page size {s:?} (A4, LETTER... or 400x600)"))?);
     }
     if let Some(l) = p.landscape {
-        o.landscape = truthy(&l);
+        o.landscape = Some(truthy(&l));
     }
     if let Some(m) = p.margin {
-        o.margin = margin(&m)?;
+        o.margin = Some(margin(&m)?);
     }
     if let Some(f) = p.font {
         o.font = f;

@@ -10,18 +10,21 @@ pub mod layout;
 pub mod render;
 pub mod style;
 
+use css::{Decl, Media};
 use krilla::page::PageSettings;
+use scraper::Html;
 use std::cell::RefCell;
 
 pub use images::ImagePolicy;
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// page size in pt (portrait)
-    pub size: (f32, f32),
-    pub landscape: bool,
-    /// top, right, bottom, left in pt
-    pub margin: [f32; 4],
+    /// page size in pt (portrait). None: the document's `@page { size }`, else A4
+    pub size: Option<(f32, f32)>,
+    /// None: the document's `@page { size: landscape }`, else portrait
+    pub landscape: Option<bool>,
+    /// top, right, bottom, left in pt. None: the document's `@page { margin }`, else 40
+    pub margin: Option<[f32; 4]>,
     /// default family: Helvetica, Times-Roman, Courier, a CSS generic, or a family of the fonts directory
     pub font: String,
     pub font_size: f32,
@@ -39,9 +42,9 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            size: page_size("A4").unwrap(),
-            landscape: false,
-            margin: [40.0; 4],
+            size: None,
+            landscape: None,
+            margin: None,
             font: "Helvetica".into(),
             font_size: 12.0,
             header: None,
@@ -79,21 +82,89 @@ thread_local! {
     static LCX: RefCell<parley::LayoutContext<layout::Brush>> = RefCell::new(parley::LayoutContext::new());
 }
 
-/// A laid out header / footer for one page.
-fn band(html: &str, page: usize, pages: usize, o: &Options, width: f32) -> layout::Tree {
+/// A laid out header / footer for one page. It can use the document's @font-face fonts.
+fn band(html: &str, page: usize, pages: usize, o: &Options, width: f32, media: &Media, faces: &[fonts::DocFace]) -> layout::Tree {
     let html = html.replace("{page}", &page.to_string()).replace("{pages}", &pages.to_string());
-    let mut t = LCX.with(|lcx| layout::build(&html, &o.images, &o.font, o.font_size, width, &mut lcx.borrow_mut()));
+    let doc = Html::parse_document(&html);
+    let sheet = layout::stylesheet(&doc, media);
+    let mut faces = faces.to_vec();
+    faces.extend(layout::load_font_faces(&sheet.font_faces, &o.images));
+    let mut t = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, width, &mut lcx.borrow_mut()));
     t.compute(width);
     t
 }
 
+/// Page size (landscape applied) and margins: the request's options, else the document's `@page`, else A4 / 40pt.
+fn page_setup(o: &Options, pages: &[Vec<Decl>]) -> ((f32, f32), [f32; 4]) {
+    let (mut size, mut landscape, mut margin) = (None, None, [None; 4]);
+    let px = |v: &str| style::len(v, o.font_size, o.font_size).and_then(style::Len::px);
+    for d in pages.iter().flatten() {
+        let v = d.value.to_ascii_lowercase();
+        match d.prop.as_str() {
+            "size" => {
+                let dims: Vec<f32> = v.split_whitespace().filter_map(px).collect();
+                match dims[..] {
+                    [a] => size = Some((a, a)),
+                    [a, b] => size = Some((a, b)),
+                    _ => {}
+                }
+                for w in v.split_whitespace() {
+                    match w {
+                        "landscape" => landscape = Some(true),
+                        "portrait" => landscape = Some(false),
+                        w => {
+                            if let Some(s) = page_size(w).filter(|_| !w.contains(|c: char| c.is_ascii_digit()) || w.len() <= 3) {
+                                size = Some(s);
+                            }
+                        }
+                    }
+                }
+            }
+            "margin" => {
+                let m: Vec<f32> = v.split_whitespace().filter_map(px).collect();
+                let m = match m[..] {
+                    [a] => [a; 4],
+                    [a, b] => [a, b, a, b],
+                    [a, b, c] => [a, b, c, b],
+                    [a, b, c, d] => [a, b, c, d],
+                    _ => continue,
+                };
+                margin = m.map(Some);
+            }
+            "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+                let i = ["margin-top", "margin-right", "margin-bottom", "margin-left"].iter().position(|p| *p == d.prop).unwrap();
+                margin[i] = px(&v).or(margin[i]);
+            }
+            _ => {}
+        }
+    }
+    let (w, h) = o.size.or(size).unwrap_or_else(|| page_size("A4").unwrap());
+    let page = if o.landscape.or(landscape).unwrap_or(false) { (w.max(h), w.min(h)) } else { (w, h) };
+    (page, o.margin.unwrap_or(margin.map(|m| m.unwrap_or(40.0))))
+}
+
+/// Forgets the document's @font-face fonts, however the render ends.
+struct DocGuard;
+impl Drop for DocGuard {
+    fn drop(&mut self) {
+        render::end_document();
+    }
+}
+
 /// Render `html` to PDF bytes.
 pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
-    let (pw, ph) = if o.landscape { (o.size.1, o.size.0) } else { o.size };
-    let [mt, mr, mb, ml] = o.margin;
+    let _guard = DocGuard;
+    let doc = Html::parse_document(html);
+    // @page first (it can sit in @media print), then the sheets for the real page area
+    let provisional = Media { width: 515.28, height: 761.89 };
+    let sheet = layout::stylesheet(&doc, &provisional);
+    let ((pw, ph), [mt, mr, mb, ml]) = page_setup(o, &sheet.pages);
     let (cw, ch) = ((pw - ml - mr).max(1.0), (ph - mt - mb).max(1.0));
+    let media = Media { width: cw, height: ch };
+    let sheet = if (cw - provisional.width).abs() < 0.5 && (ch - provisional.height).abs() < 0.5 { sheet } else { layout::stylesheet(&doc, &media) };
+    let faces = layout::load_font_faces(&sheet.font_faces, &o.images);
 
-    let mut tree = LCX.with(|lcx| layout::build(html, &o.images, &o.font, o.font_size, cw, &mut lcx.borrow_mut()));
+    let mut tree = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, cw, &mut lcx.borrow_mut()));
     tree.compute(cw);
     let breaks = render::collect_breaks(&tree);
     let pages = render::paginate(ch, &breaks);
@@ -140,7 +211,7 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
             // header / footer, vertically centered in their margin
             for (html, top, height) in [(&o.header, 0.0, mt), (&o.footer, ph - mb, mb)] {
                 let Some(html) = html else { continue };
-                let t = band(html, i + 1, n, o, cw);
+                let t = band(html, i + 1, n, o, cw, &media, &faces);
                 let th = t.taffy.layout(t.root).map(|l| l.size.height).unwrap_or(0.0);
                 let y = top + (height - th) / 2.0;
                 let mut found = Vec::new();
