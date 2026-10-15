@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}{{ societe.nom }}{% endblock %}</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm 22mm;
+    @bottom-left { content: "{{ societe.nom }} — SIRET {{ societe.siret }}"; font-size: 7.5px; color: #888 }
+    @bottom-right { content: "Page " counter(page) " / " counter(pages); font-size: 7.5px; color: #888 }
+  }
+  :root { --accent: {{ societe.couleur | default("#2c6fbb") }}; }
+  body { font-family: "Segoe UI", Helvetica, sans-serif; font-size: 9.5px; color: #222 }
+  h1 { font-size: 20px; color: var(--accent); margin: 0 }
+  .muted { color: #777 }
+  .head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 18px }
+  .head img { width: 44px; margin-right: 10px }
+  .brand { display: flex; align-items: center }
+  .parties { display: flex; gap: 20px; margin-bottom: 16px }
+  .party { flex: 1; padding: 8px 10px; border-radius: 4px; background: #f5f7fa }
+  .party b { display: block; font-size: 10.5px; margin-bottom: 2px }
+  table { width: 100%; border-collapse: collapse }
+  th { background: var(--accent); color: white; font-weight: 600; padding: 5px 6px; text-align: left }
+  td { padding: 4px 6px; border-bottom: 1px solid #e3e6ea; vertical-align: top }
+  .n { text-align: right; white-space: nowrap }
+  .totals { width: 45%; margin: 6px 0 0 auto; page-break-inside: avoid }
+  .totals td { border: none; padding: 3px 6px }
+  .totals tr.total td { font-size: 11px; font-weight: bold; color: var(--accent); border-top: 2px solid var(--accent); padding-top: 6px }
+  .notes { margin-top: 16px; padding: 8px 10px; border-left: 3px solid var(--accent); background: #f5f7fa }
+</style>
+</head>
+<body>
+{% block content %}{% endblock %}
+</body>
+</html>

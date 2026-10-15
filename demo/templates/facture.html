@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Facture {{ numero }}{% endblock %}
+{% block content %}
+{# totaux calculés dans le modèle : les données ne portent que les lignes #}
+{% set ns = namespace(ht=0) %}
+{% for l in lignes %}{% set ns.ht = ns.ht + l.quantite * l.prix %}{% endfor %}
+{% set tva = ns.ht * taux_tva / 100 %}
+
+<div class="head">
+  <div class="brand"><img src="logo.png"><div><h1>{{ societe.nom }}</h1><div class="muted">{{ societe.adresse | nl2br }}</div></div></div>
+  <div style="text-align: right">
+    <h1>Facture {{ numero }}</h1>
+    <div>Émise le {{ date | date("%e %B %Y") }}</div>
+    <div class="muted">Échéance : {{ echeance | date }}</div>
+  </div>
+</div>
+
+<div class="parties">
+  <div class="party"><span class="muted">De</span><b>{{ societe.nom }}</b>{{ societe.adresse | nl2br }}<br>{{ societe.email }}</div>
+  <div class="party"><span class="muted">Facturé à</span><b>{{ client.nom }}</b>{{ client.adresse | nl2br }}{% if client.tva is defined %}<br>TVA : {{ client.tva }}{% endif %}</div>
+</div>
+
+<table>
+  <thead><tr><th>Désignation</th><th class="n">Qté</th><th class="n">Prix unitaire</th><th class="n">Montant HT</th></tr></thead>
+  <tbody>
+  {% for l in lignes %}
+    <tr><td>{{ l.libelle }}{% if l.detail is defined %}<br><span class="muted">{{ l.detail }}</span>{% endif %}</td>
+      <td class="n">{{ l.quantite | number }}</td><td class="n">{{ l.prix | money }}</td><td class="n">{{ (l.quantite * l.prix) | money }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{# en dehors du tableau : un <tfoot> se répéterait en bas de chaque page #}
+<table class="totals">
+  <tr><td>Total HT</td><td class="n">{{ ns.ht | money }}</td></tr>
+  <tr><td>TVA {{ taux_tva | number }} %</td><td class="n">{{ tva | money }}</td></tr>
+  <tr class="total"><td>Total TTC</td><td class="n">{{ (ns.ht + tva) | money }}</td></tr>
+</table>
+
+{% if notes is defined %}<div class="notes">{{ notes | nl2br }}</div>{% endif %}
+<p class="muted">Paiement par virement : {{ societe.iban }} — pénalités de retard : 3 fois le taux d'intérêt légal.</p>
+{% endblock %}

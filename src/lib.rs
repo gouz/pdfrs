@@ -10,6 +10,7 @@ pub mod layout;
 pub mod remote;
 pub mod render;
 pub mod style;
+pub mod template;
 
 use css::{Decl, Media, PageRule};
 use krilla::page::PageSettings;

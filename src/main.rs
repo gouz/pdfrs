@@ -1,5 +1,5 @@
 //! `pdfrs` with no argument (or `pdfrs serve`): HTTP server, POST HTML, get a PDF.
-//! `pdfrs input.html [output.pdf] [options]`: one-shot conversion.
+//! `pdfrs input.html [output.pdf] [options]`: one-shot conversion (`--data d.json`: input is a template).
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Query, State};
@@ -7,9 +7,9 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use pdfrs::{html_to_pdf, page_size, ImagePolicy, Options};
+use pdfrs::{html_to_pdf, page_size, template, ImagePolicy, Options};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -33,9 +33,17 @@ struct Params {
     keywords: Option<String>,
 }
 
+/// `{"html": ...}`, or a template and its data: `{"template": ..., "data": {...}}` /
+/// `{"template_name": "invoice.html", "data": {...}}` (a file of TEMPLATES_DIR)
 #[derive(Deserialize)]
 struct JsonBody {
-    html: String,
+    html: Option<String>,
+    template: Option<String>,
+    #[serde(alias = "templateName")]
+    template_name: Option<String>,
+    #[serde(default)]
+    data: serde_json::Value,
+    locale: Option<String>,
     #[serde(flatten)]
     params: Params,
 }
@@ -93,7 +101,38 @@ fn options(p: Params, images: ImagePolicy) -> Result<Options, String> {
     Ok(o)
 }
 
-type Job = (String, Options, oneshot::Sender<Result<Vec<u8>, String>>);
+/// What to render: HTML, or a template with its data.
+enum Input {
+    Html(String),
+    Template { inline: Option<String>, name: Option<String>, data: serde_json::Value, locale: String },
+}
+
+/// A failed render: the HTTP status (400: the template or its data, 500: rendering) and why.
+type Failure = (StatusCode, String);
+type Job = (Input, Options, Option<PathBuf>, oneshot::Sender<Result<Vec<u8>, Failure>>);
+
+/// Fill the template, then render the HTML. The header / footer options are templates too.
+fn produce(input: Input, mut opts: Options, templates: Option<&Path>) -> Result<Vec<u8>, Failure> {
+    let html = match input {
+        Input::Html(html) => html,
+        Input::Template { inline, name, data, locale } => {
+            fn fill(source: template::Source, data: &serde_json::Value, dir: Option<&Path>, locale: &str) -> Result<String, Failure> {
+                template::render(source, data, dir, locale).map_err(|e| (StatusCode::BAD_REQUEST, format!("template: {e}")))
+            }
+            for band in [&mut opts.header, &mut opts.footer] {
+                if let Some(b) = band.take() {
+                    *band = Some(fill(template::Source::Inline(&b), &data, templates, &locale)?);
+                }
+            }
+            match (&inline, &name) {
+                (Some(t), _) => fill(template::Source::Inline(t), &data, templates, &locale)?,
+                (None, Some(n)) => fill(template::Source::Named(n), &data, templates, &locale)?,
+                (None, None) => unreachable!(),
+            }
+        }
+    };
+    html_to_pdf(&html, &opts).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
 
 /// Fixed pool of render threads: each keeps its font and layout caches warm across requests.
 /// Requests beyond the pool size wait in the channel (bounded memory, like pdfjs's queue).
@@ -108,8 +147,9 @@ fn spawn_workers(n: usize) -> mpsc::Sender<Job> {
             .stack_size(16 * 1024 * 1024)
             .spawn(move || loop {
                 let job = rx.lock().unwrap().recv();
-                let Ok((html, opts, reply)) = job else { break };
-                let result = std::panic::catch_unwind(|| html_to_pdf(&html, &opts)).unwrap_or_else(|_| Err("render panicked".into()));
+                let Ok((input, opts, templates, reply)) = job else { break };
+                let result = std::panic::catch_unwind(|| produce(input, opts, templates.as_deref()))
+                    .unwrap_or_else(|_| Err((StatusCode::INTERNAL_SERVER_ERROR, "render panicked".into())));
                 let _ = reply.send(result);
             })
             .expect("spawn render thread");
@@ -120,29 +160,42 @@ fn spawn_workers(n: usize) -> mpsc::Sender<Job> {
 struct AppState {
     jobs: Mutex<mpsc::Sender<Job>>,
     images: ImagePolicy,
+    templates: Option<PathBuf>,
+    locale: String,
 }
 
 async fn render(State(st): State<Arc<AppState>>, Query(q): Query<Params>, headers: HeaderMap, body: Bytes) -> Response {
     let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json"));
-    let (html, params) = if is_json {
+    let (input, params) = if is_json {
         match serde_json::from_slice::<JsonBody>(&body) {
-            Ok(b) => (b.html, b.params),
+            Ok(b) => {
+                let input = match (b.html, b.template, b.template_name) {
+                    (Some(html), None, None) => Input::Html(html),
+                    (None, Some(t), None) => Input::Template { inline: Some(t), name: None, data: b.data, locale: b.locale.unwrap_or_else(|| st.locale.clone()) },
+                    (None, None, Some(name)) if st.templates.is_some() => {
+                        Input::Template { inline: None, name: Some(name), data: b.data, locale: b.locale.unwrap_or_else(|| st.locale.clone()) }
+                    }
+                    (None, None, Some(_)) => return (StatusCode::BAD_REQUEST, "template_name: no TEMPLATES_DIR on this server\n").into_response(),
+                    _ => return (StatusCode::BAD_REQUEST, "give one of html, template, template_name\n").into_response(),
+                };
+                (input, b.params)
+            }
             Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}\n")).into_response(),
         }
     } else {
-        (String::from_utf8_lossy(&body).into_owned(), q)
+        (Input::Html(String::from_utf8_lossy(&body).into_owned()), q)
     };
     let opts = match options(params, st.images.clone()) {
         Ok(o) => o,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
     };
     let (reply, wait) = oneshot::channel();
-    if st.jobs.lock().unwrap().send((html, opts, reply)).is_err() {
+    if st.jobs.lock().unwrap().send((input, opts, st.templates.clone(), reply)).is_err() {
         return (StatusCode::SERVICE_UNAVAILABLE, "render pool stopped\n").into_response();
     }
     match wait.await {
         Ok(Ok(pdf)) => ([(header::CONTENT_TYPE, "application/pdf")], pdf).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+        Ok(Err((status, e))) => (status, format!("{e}\n")).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "render failed\n").into_response(),
     }
 }
@@ -154,6 +207,9 @@ const USAGE: &str = "pdfrs: POST HTML to / (or /pdf), get a PDF back.
 
 Options (query string or JSON fields): size, landscape, margin, font, fontSize, header, footer,
 title, author, subject, keywords.
+
+Templates (JSON): {\"template\": \"<h1>{{ title }}</h1>\", \"data\": {...}} or {\"template_name\": \"invoice.html\",
+\"data\": {...}} (TEMPLATES_DIR), optional \"locale\" (fr, en, de...) for the money / number / date filters.
 ";
 
 fn env_dirs(var: &str, default: &str) -> Vec<PathBuf> {
@@ -176,12 +232,15 @@ async fn serve() {
         .filter(|w| *w > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let remote = std::env::var("REMOTE_RESOURCES").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    let templates = std::env::var("TEMPLATES_DIR").ok().filter(|d| !d.is_empty()).map(PathBuf::from);
     let images = ImagePolicy {
-        base_dir: std::env::var("IMAGES_DIR").ok().filter(|d| !d.is_empty()).map(PathBuf::from),
+        // images and stylesheets next to the templates, unless they have a directory of their own
+        base_dir: std::env::var("IMAGES_DIR").ok().filter(|d| !d.is_empty()).map(PathBuf::from).or_else(|| templates.clone()),
         remote: remote.then(|| Arc::new(pdfrs::remote::RemoteConfig::from_env())),
     };
     let max_body = std::env::var("MAX_BODY_MB").ok().and_then(|m| m.parse::<usize>().ok()).unwrap_or(20) * 1024 * 1024;
-    let state = Arc::new(AppState { jobs: Mutex::new(spawn_workers(workers)), images });
+    let locale = std::env::var("LOCALE").ok().filter(|l| !l.is_empty()).unwrap_or_else(|| "fr".into());
+    let state = Arc::new(AppState { jobs: Mutex::new(spawn_workers(workers)), images, templates, locale });
     let app = Router::new()
         .route("/", post(render).get(|| async { USAGE }))
         .route("/pdf", post(render))
@@ -210,6 +269,7 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     let mut p = Params::default();
     let mut pos = Vec::new();
     let mut remote = false;
+    let (mut data, mut locale): (Option<String>, Option<String>) = (None, None);
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or(format!("{a}: missing value"));
@@ -223,6 +283,8 @@ fn cli(args: Vec<String>) -> Result<(), String> {
             "--footer" => p.footer = Some(val()?),
             "--title" => p.title = Some(val()?),
             "--remote" => remote = true,
+            "--data" => data = Some(val()?),
+            "--locale" => locale = Some(val()?),
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => pos.push(a),
@@ -234,14 +296,25 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     fonts_init();
     // local images: only from the input file's folder
     let base = std::fs::canonicalize(&input).ok().and_then(|p| p.parent().map(PathBuf::from));
-    let opts = options(p, ImagePolicy { base_dir: base, remote: remote.then(|| Arc::new(pdfrs::remote::RemoteConfig::from_env())) })?;
+    let opts = options(p, ImagePolicy { base_dir: base.clone(), remote: remote.then(|| Arc::new(pdfrs::remote::RemoteConfig::from_env())) })?;
+    // --data: the input is a template of its folder, filled with that JSON
+    let job = match data {
+        None => Input::Html(html),
+        Some(path) => {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+            let data = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+            let name = input.file_name().map(|n| n.to_string_lossy().into_owned());
+            Input::Template { inline: None, name, data, locale: locale.unwrap_or_else(|| "fr".into()) }
+        }
+    };
     // same stack as the server's render threads
     let pdf = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || html_to_pdf(&html, &opts))
+        .spawn(move || produce(job, opts, base.as_deref()))
         .map_err(|e| e.to_string())?
         .join()
-        .map_err(|_| "render panicked".to_string())??;
+        .map_err(|_| "render panicked".to_string())?
+        .map_err(|(_, e)| e)?;
     std::fs::write(&output, pdf).map_err(|e| format!("{output}: {e}"))?;
     println!("✔ {output}");
     Ok(())
@@ -256,12 +329,13 @@ fn main() {
             eprintln!("pdfrs: {e}");
         }
         eprintln!(
-            "Usage: pdfrs                                   HTTP server (PORT, WORKERS, FONTS_DIR, IMAGES_DIR, REMOTE_RESOURCES)
+            "Usage: pdfrs                                   HTTP server (PORT, WORKERS, FONTS_DIR, IMAGES_DIR, TEMPLATES_DIR, LOCALE, REMOTE_RESOURCES)
        pdfrs <input.html> [output.pdf] [options]
   --size A4|LETTER|400x600   --landscape   --margin 40 | '60 40 50 40'
   --font Georgia             --font-size 12
   --header '<p>Titre</p>'    --footer '<p>{{page}} / {{pages}}</p>'   --title 'Facture 42'
-  --remote                   also load http(s) images, stylesheets and fonts (REMOTE_HOSTS, REMOTE_ALLOW_PRIVATE...)"
+  --remote                   also load http(s) images, stylesheets and fonts (REMOTE_HOSTS, REMOTE_ALLOW_PRIVATE...)
+  --data data.json           the input is a MiniJinja template, filled with this JSON   --locale fr|en|de..."
         );
         std::process::exit(1);
     }

@@ -29,11 +29,11 @@ curl -H 'content-type: application/json' \
 
 | Route | |
 |---|---|
-| `POST /` or `POST /pdf` | body: the HTML (`text/html`, or anything), or `{"html": …, …options}` (`application/json`). Response: `application/pdf` |
+| `POST /` or `POST /pdf` | body: the HTML (`text/html`, or anything), or `{"html": …, …options}` / `{"template": …, "data": {…}}` / `{"template_name": …, "data": {…}}` (`application/json`, see [Templates](#templates)). Response: `application/pdf` |
 | `GET /health` | `ok` |
 | `GET /` | usage |
 
-Errors: `400` for an invalid option (the message says which one), `500` if rendering fails.
+Errors: `400` for an invalid option or a template / data error (the message says which one, and where), `500` if rendering fails.
 
 ### Options
 
@@ -60,11 +60,72 @@ As query parameters or JSON fields:
 | `WORKERS` | number of cores | render threads; extra requests wait their turn |
 | `FONTS_DIR` | `/fonts` | font directories (`.ttf`, `.otf`, `.ttc`, `.woff`, `.woff2`, recursive), separated by `:` |
 | `IMAGES_DIR` | — | directory for local images, stylesheets and fonts, see [Images](#images) |
+| `TEMPLATES_DIR` | — | directory of the templates (`template_name`), see [Templates](#templates); also the image directory when `IMAGES_DIR` is not set |
+| `LOCALE` | `fr` | default locale of the `money` / `number` / `date` template filters |
 | `REMOTE_RESOURCES` | off | `1`: also load http(s) images, stylesheets and fonts, see [Remote resources](#remote-resources) |
 | `REMOTE_HOSTS` | any public host | comma separated allow-list: `cdn.example.com,*.example.org` |
 | `REMOTE_TIMEOUT_MS` / `REMOTE_MAX_MB` | `5000` / `10` | per download |
 | `REMOTE_ALLOW_PRIVATE` | off | `1`: allow loopback and private addresses (a trusted internal network only) |
 | `MAX_BODY_MB` | `20` | maximum request size |
+
+## Templates
+
+Instead of HTML, send a [MiniJinja](https://github.com/mitsuhiko/minijinja) template (Jinja / Twig syntax) and its data: pdfrs fills the template, then renders it. Callers send data, the layout lives in the templates.
+
+```bash
+# a template of TEMPLATES_DIR
+curl -H 'content-type: application/json' -d '{
+  "template_name": "facture.html",
+  "data": { "numero": "2026-0142", "client": { "nom": "ACME" }, "lignes": [{ "libelle": "Café", "quantite": 2, "prix": 3 }] },
+  "size": "A4"
+}' http://localhost:3000/ -o facture.pdf
+
+# or the template itself, inline
+curl -H 'content-type: application/json' -d '{
+  "template": "<h1>Facture {{ numero }}</h1>{% for l in lignes %}<p>{{ l.libelle }} : {{ l.prix | money }}</p>{% endfor %}",
+  "data": { "numero": 42, "lignes": [{ "libelle": "Café", "prix": 3 }] },
+  "locale": "en"
+}' http://localhost:3000/ -o facture.pdf
+
+docker run -p 3000:3000 -v ./templates:/templates:ro -e TEMPLATES_DIR=/templates ghcr.io/gouz/pdfrs:main
+```
+
+| Field | |
+|---|---|
+| `template` / `template_name` | the template's text, or the name of a file of `TEMPLATES_DIR` (`facture.html`, `clients/acme.html`); one of them, or `html` |
+| `data` | a JSON object: the template's variables |
+| `locale` | `fr` (default, or `LOCALE`), `en`, `de`, `es`, `it`, `fr-CH`…: digit grouping, decimal mark, currency position, month names |
+| `header`, `footer` | templates too (same data), with `{page}` / `{pages}` |
+| every other option | `size`, `margin`, `title`… as for HTML |
+
+- **Syntax**: `{{ client.nom }}`, `{% for l in lignes %}…{% endfor %}`, `{% if remise is defined %}…{% endif %}`, `{% set ns = namespace(total=0) %}` for sums in a loop, `loop.index`, `{# comments #}`, macros, and every [built-in filter](https://docs.rs/minijinja/latest/minijinja/filters/) (`default`, `length`, `round`, `sum`, `upper`, `join`, `sort`, `groupby`, `tojson`…).
+- **Layouts**: `{% extends "base.html" %}` and `{% include "parts/address.html" %}` read other templates of `TEMPLATES_DIR` (an inline template can extend them too). A template edited on disk is picked up by the next request, no restart.
+- **Strict**: a variable missing from the data is an error (`400`, with the template and the line), so a typo in the data does not print an empty invoice. Optional fields: `{{ client.tva | default("") }}`, `{% if client.tva is defined %}`.
+- **Escaped**: every `{{ … }}` is HTML-escaped, a `<` or `</td>` in the data cannot break the document or inject markup. `| safe` opts out, for trusted HTML only.
+- **Bounded**: a template only reads files of its directory (no `../`, absolute path or symlink out of it), a recursion limit, and a budget of instructions (an endless loop is a `400`, not a stuck render thread).
+- Images, stylesheets and fonts of the templates (`<img src="logo.png">`, `<link href="style.css">`) come from `TEMPLATES_DIR` unless `IMAGES_DIR` is set.
+
+Filters for business documents:
+
+| Filter | `fr` | `en` |
+|---|---|---|
+| `{{ 1234.5 \| money }}` | `1 234,50 €` | `€1,234.50` |
+| `{{ 99 \| money("USD") }}` | `99,00 $` | `$99.00` |
+| `{{ total \| money(decimals=0) }}` | `1 235 €` | `€1,235` |
+| `{{ 1234.5 \| number }}` / `number(2)` | `1 235` / `1 234,50` | `1,235` / `1,234.50` |
+| `{{ "2026-10-15" \| date }}` | `15/10/2026` | `10/15/2026` |
+| `{{ "2026-10-15" \| date("%A %e %B %Y") }}` | `jeudi 15 octobre 2026` | `Thursday 15 October 2026` |
+| `{{ adresse \| nl2br }}` | line breaks as `<br>`, escaped | |
+
+Amounts are rounded half away from zero (`2.675` → `2,68`), dates are `YYYY-MM-DD` with an optional time (`2026-10-15T08:30:00Z`, `%H:%M`), any filter takes `locale="…"` to override the request's.
+
+From the command line, `--data` makes the input a template of its folder:
+
+```bash
+pdfrs demo/templates/facture.html facture.pdf --data demo/templates/facture.json --locale fr
+```
+
+[`demo/templates/`](demo/templates) holds a complete invoice: `base.html` (styles, `@page`, numbered footer), `facture.html` (`extends` it; totals computed in the template), `facture.json`, rendered as [`demo/facture.pdf`](demo/facture.pdf) (2 pages, the table header repeated).
 
 ## Deploy on Google Cloud Run
 
@@ -125,7 +186,7 @@ gcloud run services update pdfrs --region=$REGION \
   --update-env-vars=IMAGES_DIR=/assets,FONTS_DIR=/fonts:/assets/fonts
 ```
 
-`<img src="logo.png">` then reads `gs://my-pdf-assets/logo.png`, and the fonts of `gs://my-pdf-assets/fonts/` are loaded at start-up (redeploy to pick up new fonts). The service account of the service needs `roles/storage.objectViewer` on the bucket.
+Templates the same way: `--update-env-vars=TEMPLATES_DIR=/assets/templates` serves the templates of `gs://my-pdf-assets/templates/` (edited templates are picked up without redeploying). `<img src="logo.png">` then reads `gs://my-pdf-assets/logo.png`, and the fonts of `gs://my-pdf-assets/fonts/` are loaded at start-up (redeploy to pick up new fonts). The service account of the service needs `roles/storage.objectViewer` on the bucket.
 
 **Remote resources on GCP.** If you enable them (`REMOTE_RESOURCES=1`), keep the guards on: the metadata server (`169.254.169.254`, `metadata.google.internal`) hands out access tokens of the service account, and is precisely what an SSRF goes after. pdfrs refuses link-local and private addresses, so it is not reachable from a document; never set `REMOTE_ALLOW_PRIVATE=1` on Cloud Run. Prefer `REMOTE_HOSTS` with the hosts your templates actually use. Through a VPC connector with all traffic routed to the VPC, remote resources need Cloud NAT to reach the internet.
 
@@ -139,7 +200,7 @@ cargo run --release -- invoice.html invoice.pdf --size A5 --footer '<p>{page} / 
 docker run --rm -v "$PWD":/w -w /w --entrypoint /pdfrs pdfrs invoice.html invoice.pdf
 ```
 
-Options: `--size`, `--landscape`, `--margin`, `--font`, `--font-size`, `--header`, `--footer`, `--title`, `--remote`. Local images, stylesheets and fonts are allowed from the HTML file's folder.
+Options: `--size`, `--landscape`, `--margin`, `--font`, `--font-size`, `--header`, `--footer`, `--title`, `--remote`, `--data data.json` (the input is a [template](#templates)), `--locale`. Local images, stylesheets and fonts are allowed from the HTML file's folder.
 
 ## Fonts
 

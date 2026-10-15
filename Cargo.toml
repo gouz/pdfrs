@@ -23,6 +23,7 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "macros", "s
 usvg = "0.47"
 wuff = "0.2.9"
 ureq = "3.4.2"
+minijinja = { version = "3.0.0", features = ["fuel", "loop_controls", "serde", "preserve_order", "urlencode"] }
 
 [profile.release]
 lto = "fat"

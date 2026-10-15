@@ -1,0 +1,184 @@
+{
+  "numero": "2026-0142",
+  "date": "2026-10-15",
+  "echeance": "2026-11-14",
+  "taux_tva": 20,
+  "societe": {
+    "nom": "Zenika Labs",
+    "adresse": "10 rue de Milan\n75009 Paris",
+    "siret": "123 456 789 00012",
+    "email": "facturation@exemple.fr",
+    "iban": "FR76 3000 6000 0112 3456 7890 189",
+    "couleur": "#c0392b"
+  },
+  "client": {
+    "nom": "ACME Industries",
+    "adresse": "42 avenue des Champs\n69002 Lyon",
+    "tva": "FR12 345678901"
+  },
+  "lignes": [
+    {
+      "libelle": "Développement — lot 1",
+      "quantite": 5,
+      "prix": 650,
+      "detail": "Jours de développement backend"
+    },
+    {
+      "libelle": "Revue de code — lot 2",
+      "quantite": 3,
+      "prix": 480
+    },
+    {
+      "libelle": "Hébergement — lot 3",
+      "quantite": 12,
+      "prix": 89.9,
+      "detail": "Mois de serveur dédié"
+    },
+    {
+      "libelle": "Formation Rust — lot 4",
+      "quantite": 1,
+      "prix": 2400,
+      "detail": "Session de 2 jours, 6 participants"
+    },
+    {
+      "libelle": "Support — lot 5",
+      "quantite": 3,
+      "prix": 350,
+      "detail": "Forfait mensuel"
+    },
+    {
+      "libelle": "Développement — lot 6",
+      "quantite": 5,
+      "prix": 650,
+      "detail": "Jours de développement backend"
+    },
+    {
+      "libelle": "Revue de code — lot 7",
+      "quantite": 3,
+      "prix": 480
+    },
+    {
+      "libelle": "Hébergement — lot 8",
+      "quantite": 12,
+      "prix": 89.9,
+      "detail": "Mois de serveur dédié"
+    },
+    {
+      "libelle": "Formation Rust — lot 9",
+      "quantite": 1,
+      "prix": 2400,
+      "detail": "Session de 2 jours, 6 participants"
+    },
+    {
+      "libelle": "Support — lot 10",
+      "quantite": 3,
+      "prix": 350,
+      "detail": "Forfait mensuel"
+    },
+    {
+      "libelle": "Développement — lot 11",
+      "quantite": 5,
+      "prix": 650,
+      "detail": "Jours de développement backend"
+    },
+    {
+      "libelle": "Revue de code — lot 12",
+      "quantite": 3,
+      "prix": 480
+    },
+    {
+      "libelle": "Hébergement — lot 13",
+      "quantite": 12,
+      "prix": 89.9,
+      "detail": "Mois de serveur dédié"
+    },
+    {
+      "libelle": "Formation Rust — lot 14",
+      "quantite": 1,
+      "prix": 2400,
+      "detail": "Session de 2 jours, 6 participants"
+    },
+    {
+      "libelle": "Support — lot 15",
+      "quantite": 3,
+      "prix": 350,
+      "detail": "Forfait mensuel"
+    },
+    {
+      "libelle": "Développement — lot 16",
+      "quantite": 5,
+      "prix": 650,
+      "detail": "Jours de développement backend"
+    },
+    {
+      "libelle": "Revue de code — lot 17",
+      "quantite": 3,
+      "prix": 480
+    },
+    {
+      "libelle": "Hébergement — lot 18",
+      "quantite": 12,
+      "prix": 89.9,
+      "detail": "Mois de serveur dédié"
+    },
+    {
+      "libelle": "Formation Rust — lot 19",
+      "quantite": 1,
+      "prix": 2400,
+      "detail": "Session de 2 jours, 6 participants"
+    },
+    {
+      "libelle": "Support — lot 20",
+      "quantite": 3,
+      "prix": 350,
+      "detail": "Forfait mensuel"
+    },
+    {
+      "libelle": "Développement — lot 21",
+      "quantite": 5,
+      "prix": 650,
+      "detail": "Jours de développement backend"
+    },
+    {
+      "libelle": "Revue de code — lot 22",
+      "quantite": 3,
+      "prix": 480
+    },
+    {
+      "libelle": "Hébergement — lot 23",
+      "quantite": 12,
+      "prix": 89.9,
+      "detail": "Mois de serveur dédié"
+    },
+    {
+      "libelle": "Formation Rust — lot 24",
+      "quantite": 1,
+      "prix": 2400,
+      "detail": "Session de 2 jours, 6 participants"
+    },
+    {
+      "libelle": "Support — lot 25",
+      "quantite": 3,
+      "prix": 350,
+      "detail": "Forfait mensuel"
+    },
+    {
+      "libelle": "Développement — lot 26",
+      "quantite": 5,
+      "prix": 650,
+      "detail": "Jours de développement backend"
+    },
+    {
+      "libelle": "Revue de code — lot 27",
+      "quantite": 3,
+      "prix": 480
+    },
+    {
+      "libelle": "Hébergement — lot 28",
+      "quantite": 12,
+      "prix": 89.9,
+      "detail": "Mois de serveur dédié"
+    }
+  ],
+  "notes": "Merci pour votre confiance.\nRèglement à 30 jours."
+}
