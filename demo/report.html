@@ -1,0 +1,67 @@
+<style>
+  body { font-family: "Segoe UI", Roboto, sans-serif; color: #222; }
+  h1 { color: #2c3e50; border-bottom: 2px solid #2c3e50; padding-bottom: 4px; }
+  .grid { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 8px; margin: 10px 0; }
+  .grid div { background: #eef; padding: 6px; border-radius: 4px; text-align: center; }
+  table { width: 100%; border-collapse: collapse; }
+  th { background: #2c3e50; color: white; padding: 4px; }
+  td { border-bottom: 1px solid #ddd; padding: 3px 4px; }
+  td.n { text-align: right; }
+  .justify { text-align: justify; }
+  pre { background: #f6f8fa; padding: 8px; font-size: 9px; }
+  .badge { background: #ffd; color: #a60; }
+  .break { page-break-before: always; }
+</style>
+<h1>Rapport <small>mensuel</small></h1>
+<p class="justify">Lorem ipsum dolor sit amet, <a href="https://example.com">un lien</a>, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. <span class="badge">surligné</span> Ut enim ad minim veniam, quis nostrud <u>exercitation</u> ullamco <s>laboris</s> nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p>
+<div class="grid"><div>1fr</div><div>2fr</div><div>1fr</div></div>
+<ul><li>Premier point</li><li>Second point avec <b>gras</b> et <i>italique</i><ul><li>imbriqué</li></ul></li></ul>
+<ol start="3"><li>trois</li><li>quatre</li></ol>
+<svg width="120" height="40" viewBox="0 0 120 40"><rect x="0" y="0" width="120" height="40" rx="8" fill="#e74c3c"/><circle cx="20" cy="20" r="12" fill="white"/></svg>
+<pre>fn main() {
+    println!("bonjour");
+}</pre>
+<table><thead><tr><th>Article</th><th>Qté</th><th>Prix</th></tr></thead><tbody>
+<tr><td>Article 1</td><td class="n">1</td><td class="n">3,00 €</td></tr>
+<tr><td>Article 2</td><td class="n">2</td><td class="n">6,00 €</td></tr>
+<tr><td>Article 3</td><td class="n">3</td><td class="n">9,00 €</td></tr>
+<tr><td>Article 4</td><td class="n">4</td><td class="n">12,00 €</td></tr>
+<tr><td>Article 5</td><td class="n">5</td><td class="n">15,00 €</td></tr>
+<tr><td>Article 6</td><td class="n">6</td><td class="n">18,00 €</td></tr>
+<tr><td>Article 7</td><td class="n">7</td><td class="n">21,00 €</td></tr>
+<tr><td>Article 8</td><td class="n">8</td><td class="n">24,00 €</td></tr>
+<tr><td>Article 9</td><td class="n">9</td><td class="n">27,00 €</td></tr>
+<tr><td>Article 10</td><td class="n">10</td><td class="n">30,00 €</td></tr>
+<tr><td>Article 11</td><td class="n">11</td><td class="n">33,00 €</td></tr>
+<tr><td>Article 12</td><td class="n">12</td><td class="n">36,00 €</td></tr>
+<tr><td>Article 13</td><td class="n">13</td><td class="n">39,00 €</td></tr>
+<tr><td>Article 14</td><td class="n">14</td><td class="n">42,00 €</td></tr>
+<tr><td>Article 15</td><td class="n">15</td><td class="n">45,00 €</td></tr>
+<tr><td>Article 16</td><td class="n">16</td><td class="n">48,00 €</td></tr>
+<tr><td>Article 17</td><td class="n">17</td><td class="n">51,00 €</td></tr>
+<tr><td>Article 18</td><td class="n">18</td><td class="n">54,00 €</td></tr>
+<tr><td>Article 19</td><td class="n">19</td><td class="n">57,00 €</td></tr>
+<tr><td>Article 20</td><td class="n">20</td><td class="n">60,00 €</td></tr>
+<tr><td>Article 21</td><td class="n">21</td><td class="n">63,00 €</td></tr>
+<tr><td>Article 22</td><td class="n">22</td><td class="n">66,00 €</td></tr>
+<tr><td>Article 23</td><td class="n">23</td><td class="n">69,00 €</td></tr>
+<tr><td>Article 24</td><td class="n">24</td><td class="n">72,00 €</td></tr>
+<tr><td>Article 25</td><td class="n">25</td><td class="n">75,00 €</td></tr>
+<tr><td>Article 26</td><td class="n">26</td><td class="n">78,00 €</td></tr>
+<tr><td>Article 27</td><td class="n">27</td><td class="n">81,00 €</td></tr>
+<tr><td>Article 28</td><td class="n">28</td><td class="n">84,00 €</td></tr>
+<tr><td>Article 29</td><td class="n">29</td><td class="n">87,00 €</td></tr>
+<tr><td>Article 30</td><td class="n">30</td><td class="n">90,00 €</td></tr>
+<tr><td>Article 31</td><td class="n">31</td><td class="n">93,00 €</td></tr>
+<tr><td>Article 32</td><td class="n">32</td><td class="n">96,00 €</td></tr>
+<tr><td>Article 33</td><td class="n">33</td><td class="n">99,00 €</td></tr>
+<tr><td>Article 34</td><td class="n">34</td><td class="n">102,00 €</td></tr>
+<tr><td>Article 35</td><td class="n">35</td><td class="n">105,00 €</td></tr>
+<tr><td>Article 36</td><td class="n">36</td><td class="n">108,00 €</td></tr>
+<tr><td>Article 37</td><td class="n">37</td><td class="n">111,00 €</td></tr>
+<tr><td>Article 38</td><td class="n">38</td><td class="n">114,00 €</td></tr>
+<tr><td>Article 39</td><td class="n">39</td><td class="n">117,00 €</td></tr>
+<tr><td>Article 40</td><td class="n">40</td><td class="n">120,00 €</td></tr>
+</tbody></table>
+<h2 class="break">Annexe</h2>
+<p>Texte après saut de page forcé. Caractères : œ æ ß → ✓ € “guillemets” — 日本</p>

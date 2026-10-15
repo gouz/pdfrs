@@ -1,0 +1,28 @@
+[package]
+name = "pdfrs"
+version = "0.1.0"
+edition = "2024"
+description = "HTML/CSS to PDF, without a browser: a Rust port of @gouz/pdfjs"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query", "json"] }
+base64 = "0.22"
+serde_json = "1"
+csscolorparser = "0.9.0"
+ego-tree = "0.11.0"
+imagesize = "0.15.0"
+krilla = "0.8.2"
+krilla-svg = "0.8.1"
+mimalloc = "0.1.52"
+parley = { version = "0.12.0", default-features = false, features = ["std"] }
+scraper = "0.27.0"
+serde = { version = "1", features = ["derive"] }
+taffy = { version = "0.15.0", features = ["parse"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
+usvg = "0.47"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
