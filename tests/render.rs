@@ -497,3 +497,33 @@ fn gradient_text_and_fixed_backgrounds() {
     assert!(text_of(&out).contains("Titre dégradé"));
     assert!(String::from_utf8_lossy(&out).contains("/Shading"));
 }
+
+#[test]
+fn left_right_pages_and_all_margin_boxes() {
+    if !has_pdftotext() {
+        return;
+    }
+    let body = "<p>ligne</p>".repeat(150);
+    let html = format!(
+        r#"<style>
+        @page {{ margin: 50px 40px; @top-left-corner {{ content: "TL" }} @right-middle {{ content: "RM" }} @bottom-right-corner {{ content: counter(page) }} }}
+        @page :left {{ margin-left: 60px; margin-right: 20px; @top-center {{ content: "Gauche" }} }}
+        @page :right {{ margin-left: 20px; margin-right: 60px; @top-center {{ content: "Droite" }} }}
+      </style>{body}"#
+    );
+    let out = pdf(&html, &Options::default());
+    let n = pages(&out);
+    assert!(n >= 3);
+    let per_page: Vec<String> = text_of(&out).split('\x0c').map(String::from).collect();
+    for i in 0..n {
+        let p = &per_page[i];
+        // page 1 is a right page, then left, right...
+        assert!(p.contains(if i % 2 == 1 { "Gauche" } else { "Droite" }), "page {}: {p}", i + 1);
+        assert!(p.contains("TL") && p.contains("RM"), "page {}: {p}", i + 1);
+    }
+    // mirrored margins: the column moves, its width does not
+    let w = words(&out);
+    let xs: Vec<f32> = w.iter().filter(|x| x.0 == "ligne").map(|x| x.1).collect();
+    let (min, max) = xs.iter().fold((f32::MAX, f32::MIN), |a, x| (a.0.min(*x), a.1.max(*x)));
+    assert!((min - 20.0).abs() < 1.0 && (max - 60.0).abs() < 1.0, "x from {min} to {max}");
+}

@@ -111,15 +111,15 @@ fn walk_breaks(tree: &Tree, n: NodeId, ox: f32, oy: f32, b: &mut Breaks) {
     }
 }
 
-/// Pages of `page_height` (`first_height` for the first one), cut so no unbreakable range is split. Always at least one page.
+/// Pages of `height_of(page index)`, cut so no unbreakable range is split. Always at least one page.
 /// A page that starts inside the body of a table with a <thead> repeats the header on top
 /// (and has that much less room).
-pub fn paginate(first_height: f32, page_height: f32, breaks: &Breaks) -> Vec<Page> {
+pub fn paginate(height_of: impl Fn(usize) -> f32, breaks: &Breaks) -> Vec<Page> {
     const EPS: f32 = 0.01;
     let mut pages = Vec::new();
     let mut start = 0.0f32;
     loop {
-        let page_height = if pages.is_empty() { first_height } else { page_height };
+        let page_height = height_of(pages.len());
         // innermost table whose body continues here: its header on top
         let header = breaks
             .tables

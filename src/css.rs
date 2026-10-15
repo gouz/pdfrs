@@ -21,8 +21,8 @@ pub enum Pseudo {
 /// An `@page` rule: page properties, and its margin boxes (`@top-center { content: ... }`).
 #[derive(Clone, Debug, Default)]
 pub struct PageRule {
-    /// `@page :first`
-    pub first: bool,
+    /// `:first`, `:left`, `:right`; None for `@page` itself
+    pub pseudo: Option<String>,
     pub decls: Vec<Decl>,
     /// (`top-left`, `top-center`, `bottom-right`...) -> declarations
     pub boxes: Vec<(String, Vec<Decl>)>,
@@ -136,7 +136,10 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
                 "media" if depth < 8 && media_matches(args, media) => parse_block(body, media, sheet, depth + 1),
                 "supports" if depth < 8 => parse_block(body, media, sheet, depth + 1),
                 // the default page and `:first`; `:left` / `:right` / named pages are not supported
-                "page" if matches!(args.trim(), "" | ":first") => sheet.pages.push(parse_page(body, args.trim() == ":first")),
+                "page" if matches!(args.trim(), "" | ":first" | ":left" | ":right") => {
+                    let pseudo = Some(args.trim().to_ascii_lowercase()).filter(|p| !p.is_empty());
+                    sheet.pages.push(parse_page(body, pseudo))
+                }
                 "font-face" => sheet.font_faces.push(parse_declarations(body)),
                 _ => {}
             }
@@ -177,8 +180,8 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
 }
 
 /// `@page` body: declarations, and nested margin boxes `@top-center { ... }`
-fn parse_page(body: &str, first: bool) -> PageRule {
-    let mut rule = PageRule { first, ..PageRule::default() };
+fn parse_page(body: &str, pseudo: Option<String>) -> PageRule {
+    let mut rule = PageRule { pseudo, ..PageRule::default() };
     let mut decls = String::new();
     let mut rest = body;
     while let Some(at) = rest.find('@') {
@@ -367,7 +370,7 @@ mod tests {
         assert_eq!(s.rules[4].pseudo, Some(Pseudo::After));
         assert!(s.has_pseudo);
         assert_eq!((s.pages.len(), s.font_faces.len()), (2, 1));
-        assert!(!s.pages[0].first && s.pages[1].first);
+        assert!(s.pages[0].pseudo.is_none() && s.pages[1].pseudo.as_deref() == Some(":first"));
         let mut s = Sheet::default();
         parse_stylesheet("@page { margin: 1cm; @top-center { content: 'T'; color: red } @bottom-right { content: counter(page) } size: A5 } li::marker { color: red } p::first-letter { font-size: 2em }", &A4, &mut s);
         let page = &s.pages[0];
