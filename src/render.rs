@@ -401,7 +401,7 @@ pub struct Link {
     pub href: u32,
 }
 
-fn draw_text(s: &mut Surface, t: &TextLeaf, x: f32, y: f32, window: (f32, f32), links: &mut Vec<Link>) {
+fn draw_text(s: &mut Surface, tree: &Tree, t: &TextLeaf, x: f32, y: f32, window: (f32, f32), links: &mut Vec<Link>) {
     for line in t.layout.lines() {
         let m = line.metrics();
         if y + m.block_max_coord <= window.0 || y + m.block_min_coord >= window.1 {
@@ -409,7 +409,18 @@ fn draw_text(s: &mut Surface, t: &TextLeaf, x: f32, y: f32, window: (f32, f32), 
         }
         let mut seen: HashMap<(usize, u16), usize> = HashMap::new();
         for item in line.items() {
-            let parley::PositionedLayoutItem::GlyphRun(gr) = item else { continue };
+            let gr = match item {
+                parley::PositionedLayoutItem::GlyphRun(gr) => gr,
+                parley::PositionedLayoutItem::InlineBox(ib) => {
+                    // inline-block / inline image: its own subtree, drawn at the box's place in the line
+                    let node = NodeId::from(ib.id);
+                    if let Ok(l) = tree.taffy.layout(node) {
+                        let (ox, oy) = (x + ib.x + l.margin.left - l.location.x, y + ib.y + l.margin.top - l.location.y);
+                        draw(s, tree, node, ox, oy, (f32::NEG_INFINITY, f32::INFINITY), links);
+                    }
+                    continue;
+                }
+            };
             let brush = &gr.style().brush;
             let run = gr.run();
             let size = run.font_size();
@@ -537,7 +548,7 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
     }
     let (cx, cy) = (x + l.padding.left + l.border.left, y + l.padding.top + l.border.top);
     match tree.taffy.get_node_context(n) {
-        Some(Leaf::Text(t)) => draw_text(s, t, cx, cy, window, links),
+        Some(Leaf::Text(t)) => draw_text(s, tree, t, cx, cy, window, links),
         Some(Leaf::Image(img)) if y < window.1 && y + h > window.0 => {
             draw_image(s, img, cx, cy, l.content_box_width(), l.content_box_height());
         }

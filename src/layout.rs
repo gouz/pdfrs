@@ -48,6 +48,8 @@ i, em, cite, var, dfn, address { font-style: italic }
 u, ins { text-decoration: underline }
 s, strike, del { text-decoration: line-through }
 small, sub, sup { font-size: 0.83em }
+sub { vertical-align: sub }
+sup { vertical-align: super }
 big { font-size: 1.17em }
 mark { background-color: yellow }
 a { color: #0000ee; text-decoration: underline }
@@ -152,17 +154,23 @@ pub struct Tree {
     pub deco: HashMap<NodeId, Deco>,
     pub links: Vec<String>,
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
+    /// (inline box root, text leaf holding it), inner boxes first
+    inline: Vec<(NodeId, NodeId)>,
 }
 
 enum Piece {
     Text(String, Rc<Style>, Brush),
     Break(Rc<Style>, Brush),
+    /// an inline-block or an inline image: a box laid out on its own, placed in the line
+    Box(NodeId, Rc<Style>),
 }
 
 #[derive(Default)]
 struct Ctx {
     children: Vec<NodeId>,
     group: Vec<Piece>,
+    /// the element whose box this is: its direct children of a flex / grid box are blockified
+    owner: Option<ego_tree::NodeId>,
 }
 
 struct Builder<'a> {
@@ -180,6 +188,7 @@ struct Builder<'a> {
     box_depth: usize,
     walk_depth: usize,
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
+    inline: Vec<(NodeId, NodeId)>,
 }
 
 /// Deeper boxes are flattened into their ancestor; deeper inline content is dropped.
@@ -263,6 +272,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             box_depth: 0,
             walk_depth: 0,
             calc: Vec::new(),
+            inline: Vec::new(),
         };
         b.taffy.disable_rounding();
         let base = Rc::new(Style::root(font, font_size));
@@ -278,7 +288,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.background = body_style.background.or(html_style.background);
         body_style.gradient = body_style.gradient.clone().or(html_style.gradient.clone());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline }
     })
 }
 
@@ -373,7 +383,22 @@ fn text_style(s: &Style, brush: Brush) -> TextStyle<'static, 'static, Brush> {
         white_space_collapse: collapse,
         text_wrap_mode: wrap,
         overflow_wrap: parley::OverflowWrap::BreakWord,
+        // only shifts apply to text runs (top / middle / bottom are for boxes and table cells)
+        vertical_align: if matches!(s.vertical_align, VAlign::Sub | VAlign::Super) { valign(s.vertical_align) } else { parley::VerticalAlign::BASELINE },
         ..TextStyle::default()
+    }
+}
+
+fn valign(v: VAlign) -> parley::VerticalAlign {
+    match v {
+        VAlign::Baseline => parley::VerticalAlign::BASELINE,
+        VAlign::Top => parley::VerticalAlign::TOP,
+        VAlign::Middle => parley::VerticalAlign::MIDDLE,
+        VAlign::Bottom => parley::VerticalAlign::BOTTOM,
+        VAlign::Sub => parley::VerticalAlign::SUB,
+        VAlign::Super => parley::VerticalAlign::SUPER,
+        VAlign::TextTop => parley::VerticalAlign::TEXT_TOP,
+        VAlign::TextBottom => parley::VerticalAlign::TEXT_BOTTOM,
     }
 }
 
@@ -547,7 +572,10 @@ impl Builder<'_> {
                 ctx.group.push(Piece::Text(text, ps.clone(), b));
             }
             _ => {
-                self.flush(ctx, container);
+                let inline = ps.inline_block && !ps.position_absolute && ps.float == taffy::Float::None;
+                if !inline {
+                    self.flush(ctx, container);
+                }
                 let mut inner = Ctx::default();
                 if !text.is_empty() {
                     inner.group.push(Piece::Text(text, ps.clone(), brush_of(&ps)));
@@ -555,7 +583,11 @@ impl Builder<'_> {
                 }
                 if let Ok(node) = self.taffy.new_with_children(to_taffy(&ps), &inner.children) {
                     self.finish_node(node, &ps);
-                    ctx.children.push(node);
+                    if inline {
+                        ctx.group.push(Piece::Box(node, ps));
+                    } else {
+                        ctx.children.push(node);
+                    }
                 }
             }
         }
@@ -567,7 +599,7 @@ impl Builder<'_> {
         if s.display == Display::Table {
             return self.build_table(el, s);
         }
-        let mut ctx = Ctx::default();
+        let mut ctx = Ctx { owner: Some(el.id()), ..Ctx::default() };
         let tag = el.value().name();
         let is_list = matches!(tag, "ul" | "ol" | "menu" | "dir");
         if is_list {
@@ -650,19 +682,33 @@ impl Builder<'_> {
                 Node::Text(t) => ctx.group.push(Piece::Text(apply_transform(t, s.transform), s.clone(), brush.clone())),
                 Node::Element(_) => {
                     let Some(el) = ElementRef::wrap(child) else { continue };
-                    let cs = Rc::new(self.style_of(el, s));
+                    let mut cs = self.style_of(el, s);
                     if cs.display == Display::None {
                         continue;
                     }
+                    // sub / sup shift their inline descendants too
+                    if matches!(s.vertical_align, VAlign::Sub | VAlign::Super) && cs.vertical_align == VAlign::Baseline && cs.display == Display::Inline {
+                        cs.vertical_align = s.vertical_align;
+                    }
+                    let cs = Rc::new(cs);
+                    // children of a flex / grid box are its items, whatever their display (blockified)
+                    let item = Some(parent.id()) == ctx.owner && matches!(container.display, Display::Flex | Display::Grid);
+                    let in_flow = !cs.position_absolute && cs.float == taffy::Float::None;
                     match el.value().name() {
                         "br" => {
                             ctx.group.push(Piece::Break(cs, brush.clone()));
                             continue;
                         }
-                        "img" | "svg" => {
+                        "img" | "svg" if item || !in_flow || cs.display != Display::Inline => {
                             self.flush(ctx, container);
                             if let Some(n) = self.replaced(el, &cs) {
                                 ctx.children.push(n);
+                            }
+                            continue;
+                        }
+                        "img" | "svg" => {
+                            if let Some(n) = self.replaced(el, &cs) {
+                                ctx.group.push(Piece::Box(n, cs));
                             }
                             continue;
                         }
@@ -688,6 +734,13 @@ impl Builder<'_> {
                             self.pseudo(el, &cs, Pseudo::After, &b, ctx, container);
                         }
                         _ if self.box_depth >= MAX_BOX_DEPTH => self.walk(*el, &cs, brush.clone(), ctx, container),
+                        _ if cs.inline_block && !item && in_flow => {
+                            self.box_depth += 1;
+                            if let Some(n) = self.build_box(el, cs.clone()) {
+                                ctx.group.push(Piece::Box(n, cs));
+                            }
+                            self.box_depth -= 1;
+                        }
                         _ => {
                             self.flush(ctx, container);
                             self.box_depth += 1;
@@ -714,7 +767,7 @@ impl Builder<'_> {
     fn text_leaf(&mut self, group: Vec<Piece>, container: &Rc<Style>) -> Option<NodeId> {
         let visible = group.iter().any(|p| match p {
             Piece::Text(t, s, _) => matches!(s.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine) && !t.is_empty() || !t.trim().is_empty(),
-            Piece::Break(..) => true,
+            Piece::Break(..) | Piece::Box(..) => true,
         });
         if !visible {
             return None;
@@ -738,6 +791,18 @@ impl Builder<'_> {
                     b.pop_style_span();
                     b.pop_style_span();
                 }
+                Piece::Box(node, s) => {
+                    // sized before layout (Tree::size_inline_boxes)
+                    b.push_inline_box(parley::InlineBox {
+                        id: u64::from(*node),
+                        kind: parley::InlineBoxKind::InFlow,
+                        index: 0,
+                        width: 0.0,
+                        height: 0.0,
+                        baseline: None,
+                        vertical_align: valign(s.vertical_align),
+                    });
+                }
             }
         }
         let (layout, text) = b.build();
@@ -748,7 +813,13 @@ impl Builder<'_> {
             TextAlign::Center => parley::Alignment::Center,
             TextAlign::Justify => parley::Alignment::Justify,
         };
-        self.taffy.new_leaf_with_context(taffy::Style::default(), Leaf::Text(TextLeaf { layout, text, align })).ok()
+        let leaf = self.taffy.new_leaf_with_context(taffy::Style::default(), Leaf::Text(TextLeaf { layout, text, align })).ok()?;
+        for p in &group {
+            if let Piece::Box(node, _) = p {
+                self.inline.push((*node, leaf));
+            }
+        }
+        Some(leaf)
     }
 
     /// <img> and inline <svg>: replaced boxes with a natural size.
@@ -1008,15 +1079,24 @@ impl Tree {
     /// Lay the tree out and set every text leaf's final line breaks and alignment.
     pub fn compute(&mut self, width: f32) {
         let space = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
+        self.size_inline_boxes();
         let _ = self.taffy.compute_layout_with_measure(self.root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
-        // calc(px + pct%): resolve against the containing block just laid out, then lay out again
-        for _ in 0..3 {
-            if !self.fix_calc() {
+        // calc(px + pct%) resolved against the containing block just laid out, inline boxes wider
+        // than their line shrunk to it (shrink-to-fit): then lay out again
+        for _ in 0..4 {
+            let calc = self.fix_calc();
+            let fit = self.fit_inline_boxes();
+            if !calc && !fit {
                 break;
             }
             let _ = self.taffy.compute_layout_with_measure(self.root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
         }
-        let mut stack = vec![self.root];
+        self.finish_text(self.root);
+    }
+
+    /// Final line breaks and alignment of the text leaves of a subtree, at their laid out width.
+    fn finish_text(&mut self, start: NodeId) {
+        let mut stack = vec![start];
         while let Some(n) = stack.pop() {
             stack.extend(self.taffy.children(n).unwrap_or_default());
             let w = self.taffy.layout(n).map(|l| l.content_box_width()).unwrap_or(0.0);
@@ -1025,5 +1105,63 @@ impl Tree {
                 t.layout.align(t.align, parley::AlignmentOptions::default());
             }
         }
+    }
+
+    /// Lay an inline box out on its own (max-content width, or `width`), then give its
+    /// margin-box size and baseline to the parley box that stands for it in its line.
+    fn lay_out_inline_box(&mut self, bx: NodeId, leaf: NodeId, width: Option<f32>) -> f32 {
+        let space = Size { width: width.map_or(AvailableSpace::MaxContent, AvailableSpace::Definite), height: AvailableSpace::MaxContent };
+        let _ = self.taffy.compute_layout_with_measure(bx, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+        self.finish_text(bx);
+        let Ok(l) = self.taffy.layout(bx).cloned() else { return 0.0 };
+        let (w, h) = (l.size.width + l.margin.left + l.margin.right, l.size.height + l.margin.top + l.margin.bottom);
+        // an inline-block sits on the baseline of its last line of text; an image (or no text) on its bottom edge
+        let baseline = match self.taffy.get_node_context(bx) {
+            Some(Leaf::Image(_)) => None,
+            _ => self.last_baseline(bx, -l.location.y).map(|b| b + l.margin.top),
+        };
+        if let Some(Leaf::Text(t)) = self.taffy.get_node_context_mut(leaf) {
+            for ib in t.layout.inline_boxes_mut() {
+                if ib.id == u64::from(bx) {
+                    (ib.width, ib.height, ib.baseline) = (w, h, baseline);
+                }
+            }
+        }
+        let _ = self.taffy.mark_dirty(leaf);
+        w
+    }
+
+    fn size_inline_boxes(&mut self) {
+        for (bx, leaf) in self.inline.clone() {
+            self.lay_out_inline_box(bx, leaf, None);
+        }
+    }
+
+    /// Inline boxes wider than their line, laid out again at the line's width; true if any shrank.
+    fn fit_inline_boxes(&mut self) -> bool {
+        let mut changed = false;
+        for (bx, leaf) in self.inline.clone() {
+            let avail = self.taffy.layout(leaf).map(|l| l.content_box_width()).unwrap_or(0.0);
+            let Ok(l) = self.taffy.layout(bx).cloned() else { continue };
+            let current = l.size.width + l.margin.left + l.margin.right;
+            if current > avail + 0.5 {
+                let margins = l.margin.left + l.margin.right;
+                if self.lay_out_inline_box(bx, leaf, Some((avail - margins).max(0.0))) < current - 0.5 {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Baseline of the last line of text in a subtree, from its top (border box).
+    fn last_baseline(&self, n: NodeId, oy: f32) -> Option<f32> {
+        let l = self.taffy.layout(n).ok()?;
+        let y = oy + l.location.y;
+        if let Some(Leaf::Text(t)) = self.taffy.get_node_context(n) {
+            return t.layout.lines().last().map(|line| y + l.padding.top + l.border.top + line.metrics().baseline);
+        }
+        let children = self.taffy.children(n).ok()?;
+        children.iter().rev().find_map(|c| self.last_baseline(*c, y))
     }
 }

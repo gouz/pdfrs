@@ -120,6 +120,10 @@ pub enum VAlign {
     Middle,
     Bottom,
     Baseline,
+    Sub,
+    Super,
+    TextTop,
+    TextBottom,
 }
 
 /// `linear-gradient()` / `radial-gradient()` (and `repeating-` variants) of a background
@@ -173,6 +177,9 @@ pub struct Style {
     pub vars: Option<Rc<HashMap<String, String>>>,
     // not inherited
     pub display: Display,
+    /// `inline-block` / `inline-flex` / `inline-grid` / `inline-table`: `display` is the inner layout,
+    /// the box itself sits in a line of text
+    pub inline_block: bool,
     pub position_absolute: bool,
     pub float: taffy::Float,
     pub clear: taffy::Clear,
@@ -249,6 +256,7 @@ impl Style {
             rtl: false,
             vars: None,
             display: Display::Block,
+            inline_block: false,
             position_absolute: false,
             float: taffy::Float::None,
             clear: taffy::Clear::None,
@@ -976,9 +984,10 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
     let one = |v: &str| len(v, em, rem);
     match prop {
         "display" => {
+            s.inline_block = matches!(lv.as_str(), "inline-block" | "inline-flex" | "inline-grid" | "inline-table");
             s.display = match lv.as_str() {
-                "block" | "flow-root" => Display::Block,
-                "inline" | "inline-block" => Display::Inline,
+                "block" | "flow-root" | "inline-block" => Display::Block,
+                "inline" => Display::Inline,
                 "flex" | "inline-flex" => Display::Flex,
                 "grid" | "inline-grid" => Display::Grid,
                 "list-item" => Display::ListItem,
@@ -1270,9 +1279,13 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
         }
         "vertical-align" => {
             s.vertical_align = match lv.as_str() {
-                "top" | "text-top" => VAlign::Top,
+                "top" => VAlign::Top,
                 "middle" => VAlign::Middle,
-                "bottom" | "text-bottom" => VAlign::Bottom,
+                "bottom" => VAlign::Bottom,
+                "sub" => VAlign::Sub,
+                "super" => VAlign::Super,
+                "text-top" => VAlign::TextTop,
+                "text-bottom" => VAlign::TextBottom,
                 _ => VAlign::Baseline,
             }
         }

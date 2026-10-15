@@ -101,13 +101,13 @@ docker run -p 3000:3000 -v ./templates/img:/images:ro -e IMAGES_DIR=/images pdfr
 
 A refused or missing image is not displayed and a warning is written to stderr.
 
-Formats: PNG, JPEG, GIF, WebP and SVG (in `<img>` or inline `<svg>…</svg>` in the HTML). An image without a size keeps its natural size (1 px = 1 pt), without exceeding the available width; `width` / `height` (attributes or CSS) are honored, keeping the aspect ratio when only one is given. `object-fit` and `border-radius` are supported.
+Formats: PNG, JPEG, GIF, WebP and SVG (in `<img>` or inline `<svg>…</svg>` in the HTML). Images are inline, as in a browser: they sit in the line of text (`vertical-align` applies, `text-align: center` centers them); `display: block`, a float or being a flex / grid item takes them out of the line. An image without a size keeps its natural size (1 px = 1 pt), without exceeding the available width; `width` / `height` (attributes or CSS) are honored, keeping the aspect ratio when only one is given. `object-fit` and `border-radius` are supported.
 
 ## Supported CSS
 
 As in pdfjs, **1 px = 1 pt**.
 
-- **Layout**: `display` `block` / `flex` / `grid` / `none` / `contents` / `list-item` / `table…`, margins that collapse like in a browser, `float` / `clear`, `position: absolute` (relative to the parent).
+- **Layout**: `display` `block` / `inline` / `inline-block` / `flex` / `inline-flex` / `grid` / `inline-grid` / `none` / `contents` / `list-item` / `table…`, margins that collapse like in a browser, `float` / `clear`, `position: absolute` (relative to the parent).
 - Full **flexbox**: `flex-direction`, `flex-wrap`, `flex` / `flex-grow` / `flex-shrink` / `flex-basis`, `justify-content`, `align-items`, `align-self`, `align-content`, `gap`, `order`.
 - **Grid**: `grid-template-columns` / `-rows` (`fr`, `repeat()`, `minmax()`, `auto`…), `grid-column` / `grid-row`, `grid-auto-flow`, `gap`, `justify-items`, `place-items`…
 - **Boxes**: `width` / `height` (+ `min-` / `max-`), `box-sizing`, `margin`, `padding`, `border` (width, `solid` / `dashed` / `dotted`, color per side), `border-radius`, `background-color`, `opacity`, `overflow: hidden`, `aspect-ratio`.
@@ -117,13 +117,14 @@ As in pdfjs, **1 px = 1 pt**.
 - **Values**: custom properties `--name` and `var(--name, fallback)` (inherited, nestable), `calc()` (`+ - * /`, parentheses, any mix of units, `calc(100% - 20px)` included), `min()` / `max()` / `clamp()` on absolute lengths.
 - **At-rules**: `@media` (`print` / `all` match, `screen` does not; `min-` / `max-width` / `-height`, range syntax `(width >= 600px)`, `orientation`, `not`, lists; evaluated against the page area), `<style media="…">`, `@supports` (assumed true), `@page` (size and margins), `@font-face`.
 - **Right-to-left**: `dir="rtl"` / `direction: rtl` (bidi text, alignment, flex and grid order, list markers on the right). Hebrew and Arabic are shaped with DejaVu Sans.
-- **Text**: `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
+- **Inline boxes**: `inline-block` (and `inline-flex` / `-grid` / `-table`) and images sit in the line of text like in a browser: padding, borders and backgrounds are kept, the box shrinks to fit the line when it is too wide, and `vertical-align` (`baseline`, `middle`, `top`, `bottom`, `text-top`, `text-bottom`) places it; `text-align` centers an image. Direct children of a flex or grid box are items instead, as in CSS.
+- **Text**: `vertical-align: sub` / `super` (`<sub>`, `<sup>`), `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
 - **Units**: `px`, `pt`, `em`, `rem`, `%`, `mm`, `cm`, `in`, `pc`. Colors: names, `#hex`, `rgb()`, `hsl()`…
 - **Pagination**: automatic page breaks between lines of text (never through a line or an image), `page-break-before` / `-after: always` (or `break-before: page`), `page-break-inside: avoid`.
 - **HTML**: tables (grid with `colspan` / `rowspan`, `border-collapse`, `border-spacing`, `vertical-align`), lists (`disc`, `circle`, `square`, `decimal`, `lower-alpha`, `upper-roman`…, `<ol start>`, `<li value>`), clickable links (`http(s):`, `mailto:`, `tel:`), `<br>`, `<pre>`, `<svg>`, browser default styles (`h1`…`h6`, `b`, `i`, `code`…), `align` / `bgcolor` attributes.
 - `<style>` with all CSS selectors (`>`, `+`, `~`, `:first-child`, `:nth-child()`, `[attr]`, `:not()`…), specificity and `!important`.
 
-**Not supported**: `background-image: url()`, `box-shadow`, `counter()` / `counter-increment` (empty in `content`), `::marker` / `::first-line` / `::first-letter`, `@page :first` / named pages / page-margin boxes (use the `header` / `footer` options), WOFF / WOFF2 fonts, external `<link>` stylesheets, `inline-block` (treated as `inline`: text keeps flowing, padding and border ignored), images in the middle of a line of text (they go on their own line), text wrapping around a `float`, repeating `<thead>` on every page.
+**Not supported**: `background-image: url()`, `box-shadow`, `counter()` / `counter-increment` (empty in `content`), `::marker` / `::first-line` / `::first-letter`, `@page :first` / named pages / page-margin boxes (use the `header` / `footer` options), WOFF / WOFF2 fonts, external `<link>` stylesheets, text wrapping around a `float`, `vertical-align` with a length or a percentage, repeating `<thead>` on every page.
 
 **Differences from pdfjs**:
 - Vertical margins collapse like in a browser (react-pdf adds them up): paragraphs are slightly tighter.
@@ -139,6 +140,7 @@ As in pdfjs, **1 px = 1 pt**.
 | [`demo/flex.html`](demo/flex.html) | [`demo/flex.pdf`](demo/flex.pdf) | flexbox |
 | [`demo/images.html`](demo/images.html) | [`demo/images.pdf`](demo/images.pdf) | images and the image policy |
 | [`demo/report.html`](demo/report.html) | [`demo/report.pdf`](demo/report.pdf) | 3 pages: grid, lists, SVG, `<pre>`, long table, forced page break (rendered with a header and a footer) |
+| [`demo/inline.html`](demo/inline.html) | [`demo/inline.pdf`](demo/inline.pdf) | badges, buttons, cards and images in the line of text, shrink-to-fit, `vertical-align`, `<sub>` / `<sup>` |
 | [`demo/features.html`](demo/features.html) | [`demo/features.pdf`](demo/features.pdf) | gradients, transforms, `calc()`, `var()`, `::before` / `::after`, `@media`, `@page`, right-to-left |
 
 ## Performance

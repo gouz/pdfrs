@@ -69,6 +69,7 @@ fn hostile_input_does_not_panic() {
         &"<div>".repeat(5000),
         &"<span>".repeat(5000),
         &"<ul><li>".repeat(2000),
+        &"<span style='display:inline-block;padding:1px'>x".repeat(2000),
         "<pre>\t\ttabs\n\n\nlines</pre><p>&nbsp;&amp;&lt;&#x1F600;</p>",
     ] {
         pdf(html, &o);
@@ -159,4 +160,57 @@ fn lot1_features_do_not_panic() {
       <div class="g"></div><div class="r"></div><div class="rep"></div><div class="t">tourné</div><div class="x">x</div>
       <div dir="rtl"><p>שלום עולם and English</p><ul><li>عربي</li></ul></div>"#;
     pdf(html, &Options::default());
+}
+
+/// words of the PDF with their box: (text, x_min, y_min, x_max)
+fn words(pdf: &[u8]) -> Vec<(String, f32, f32, f32)> {
+    let dir = std::env::temp_dir().join(format!("pdfrs-bbox-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::write(&dir, pdf).unwrap();
+    let out = std::process::Command::new("pdftotext").arg("-bbox").arg(&dir).arg("-").output().unwrap();
+    let _ = std::fs::remove_file(&dir);
+    let attr = |l: &str, a: &str| l.split(&format!("{a}=\"")).nth(1).and_then(|r| r.split('"').next()).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("<word"))
+        .map(|l| {
+            let text = l.split('>').nth(1).unwrap_or("").split('<').next().unwrap_or("").to_string();
+            (text, attr(l, "xMin"), attr(l, "yMin"), attr(l, "xMax"))
+        })
+        .collect()
+}
+
+fn line_of(w: &[(String, f32, f32, f32)], word: &str) -> f32 {
+    w.iter().find(|x| x.0 == word).unwrap_or_else(|| panic!("{word} not found in {w:?}")).2
+}
+
+#[test]
+fn inline_blocks_and_images_stay_in_the_line() {
+    if !has_pdftotext() {
+        return;
+    }
+    let img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let html = format!(
+        r#"<p>avant <span style="display:inline-block;padding:2px 6px;background:#eee">badge</span> milieu <img src="{img}" width="10" height="10"> apres</p>
+           <div style="display:flex"><span style="display:inline-block">item</span><img src="{img}" width="5"></div>"#
+    );
+    let w = words(&pdf(&html, &Options::default()));
+    let y = line_of(&w, "avant");
+    for word in ["badge", "milieu", "apres"] {
+        assert!((line_of(&w, word) - y).abs() < 4.0, "{word} left the line: {w:?}");
+    }
+    let (badge, milieu) = (w.iter().find(|x| x.0 == "badge").unwrap(), w.iter().find(|x| x.0 == "milieu").unwrap());
+    assert!(badge.3 + 6.0 <= milieu.1 + 0.5, "the badge's padding pushes the next word");
+}
+
+#[test]
+fn wide_inline_block_shrinks_to_the_line() {
+    if !has_pdftotext() {
+        return;
+    }
+    let long = "mot ".repeat(200);
+    let html = format!(r#"<p>a <span style="display:inline-block;padding:4px;border:1px solid">{long}</span> b</p>"#);
+    let w = words(&pdf(&html, &Options::default()));
+    let right = w.iter().map(|x| x.3).fold(0.0, f32::max);
+    assert!(right <= 595.28 - 40.0 + 0.5, "text overflows the page: {right}");
+    assert!(w.iter().filter(|x| x.0 == "mot").count() == 200);
 }

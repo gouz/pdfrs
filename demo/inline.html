@@ -1,0 +1,22 @@
+<style>
+  body { font-family: sans-serif; color: #222 }
+  h2 { font-size: 13px; color: #2c6fbb; margin: 14px 0 6px }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 9px; color: white; background: #2a9d5c }
+  .badge.warn { background: #e67e22 }
+  .btn { display: inline-block; padding: 4px 10px; border: 1px solid #2c6fbb; border-radius: 4px; color: #2c6fbb }
+  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px 2px 2px; background: #eef4fb; border-radius: 12px }
+  .chip img { width: 18px; height: 18px; border-radius: 9px }
+  .card { display: inline-block; width: 120px; vertical-align: top; border: 1px solid #ccc; padding: 6px; margin: 0 6px 6px 0; font-size: 10px }
+  .note { display: inline-block; background: #fdf2e9; padding: 4px; border-left: 3px solid #e67e22 }
+  .logo { width: 16px; vertical-align: middle }
+  td { border: 1px solid #ccc; padding: 4px; text-align: center }
+</style>
+<h2>inline-block</h2>
+<p>Commande n° 42 <span class="badge">payée</span> livrée le 3 mars <span class="badge warn">en retard</span>, suivie par le transporteur. Pour la retourner, cliquez sur <span class="btn">Retour</span> ou contactez <span class="chip"><img src="logo.png">Sylvain</span> directement.</p>
+<div><span class="card"><b>Carte 1</b><br>inline-block, largeur fixe, vertical-align: top</span><span class="card"><b>Carte 2</b><br>plus de texte dans celle-ci pour qu'elle soit plus haute que les autres</span><span class="card"><b>Carte 3</b><br>courte</span><span class="card"><b>Carte 4</b><br>passe à la ligne</span></div>
+<p>Avant <span class="note">un inline-block sans largeur avec beaucoup de texte : il se réduit à la largeur de la ligne et passe à la ligne à l'intérieur, comme dans un navigateur</span> après.</p>
+
+<h2>Images dans le texte</h2>
+<p>Le logo <img class="logo" src="logo.png"> est aligné au milieu de la ligne, celui-ci <img src="logo.png" width="24"> sur la ligne de base.</p>
+<p style="text-align: center"><img src="logo.png" width="60"><br>image centrée par text-align</p>
+<table><tr><td><img src="logo.png" width="30"><br>dans une cellule</td><td>H<sub>2</sub>O et E = mc<sup>2</sup>, x<sup>n<b>+1</b></sup></td></tr></table>
