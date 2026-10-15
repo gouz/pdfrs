@@ -43,7 +43,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         if p.is_dir() {
             collect(&p, out);
-        } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc")) {
+        } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "woff" | "woff2")) {
             out.push(p);
         }
     }
@@ -61,7 +61,7 @@ pub fn init(dirs: &[PathBuf]) -> usize {
     let mut blobs = Vec::new();
     let mut families = HashMap::new();
     for f in &files {
-        let Ok(data) = std::fs::read(f) else { continue };
+        let Some(data) = std::fs::read(f).ok().and_then(to_sfnt) else { continue };
         svg.load_font_data(data.clone());
         let blob = Blob::new(Arc::new(data));
         for (id, _) in collection.register_fonts(blob.clone(), None) {
@@ -144,9 +144,19 @@ pub struct DocFace {
     pub italic: bool,
 }
 
-/// sfnt data (TrueType / OpenType / collection)? WOFF / WOFF2 are not decoded.
+/// sfnt data (TrueType / OpenType / collection)?
 pub fn is_sfnt(data: &[u8]) -> bool {
     matches!(data.get(..4), Some(b"\0\x01\0\0" | b"OTTO" | b"true" | b"ttcf"))
+}
+
+/// Font file bytes as sfnt: TrueType / OpenType as is, WOFF / WOFF2 decompressed. None if neither.
+pub fn to_sfnt(data: Vec<u8>) -> Option<Vec<u8>> {
+    match data.get(..4)? {
+        b"wOFF" => wuff::decompress_woff1(&data).ok(),
+        b"wOF2" => wuff::decompress_woff2(&data).ok(),
+        _ => is_sfnt(&data).then_some(data),
+    }
+    .filter(|d| is_sfnt(d))
 }
 
 /// Like with_font_cx, plus the document's @font-face fonts, visible to this call only:

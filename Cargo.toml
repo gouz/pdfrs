@@ -21,8 +21,12 @@ serde = { version = "1", features = ["derive"] }
 taffy = { version = "0.15.0", features = ["parse"] }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
 usvg = "0.47"
+wuff = "0.2.9"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+flate2 = "1.1.10"

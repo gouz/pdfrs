@@ -124,6 +124,8 @@ pub enum VAlign {
     Super,
     TextTop,
     TextBottom,
+    /// raise by this many pt (negative: lower)
+    Length(f32),
 }
 
 /// `linear-gradient()` / `radial-gradient()` (and `repeating-` variants) of a background
@@ -152,6 +154,40 @@ pub enum BgSize {
     Contain,
     /// width, height (each may be Len::Auto: keeps the image's ratio)
     Size(Len, Len),
+}
+
+/// The image of a background layer
+#[derive(Clone, Debug, PartialEq)]
+pub enum BgSource {
+    Url(Rc<str>),
+    Gradient(Rc<Gradient>),
+}
+
+/// `background-origin` / `background-clip` box
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum BoxArea {
+    #[default]
+    Border,
+    Padding,
+    Content,
+}
+
+/// Background layers, first on top. Each list is cycled to the number of images, as in CSS.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Background {
+    pub images: Vec<BgSource>,
+    pub sizes: Vec<BgSize>,
+    pub positions: Vec<(Len, Len)>,
+    pub repeats: Vec<(bool, bool)>,
+    pub origins: Vec<BoxArea>,
+    pub clips: Vec<BoxArea>,
+}
+
+impl Background {
+    /// value of layer `i` of a list (cycled), or the initial value
+    pub fn nth<T: Copy>(list: &[T], i: usize, initial: T) -> T {
+        if list.is_empty() { initial } else { list[i % list.len()] }
+    }
 }
 
 /// One `box-shadow`
@@ -218,13 +254,13 @@ pub struct Style {
     /// top-left, top-right, bottom-right, bottom-left
     pub radius: [f32; 4],
     pub background: Option<Rgba>,
-    pub gradient: Option<Rc<Gradient>>,
-    /// `background-image: url(...)` (first layer), `background-size`, `-position`, `-repeat` (x, y)
-    pub bg_image: Option<Rc<str>>,
-    pub bg_size: BgSize,
-    pub bg_position: (Len, Len),
-    pub bg_repeat: (bool, bool),
+    /// background image layers (`url()`, gradients) and their size / position / repeat / origin / clip
+    pub bg: Option<Rc<Background>>,
     pub shadows: Option<Rc<Vec<Shadow>>>,
+    /// `counter-reset` / `counter-increment` / `counter-set`: (name, value)
+    pub counter_reset: Option<Rc<Vec<(String, i32)>>>,
+    pub counter_increment: Option<Rc<Vec<(String, i32)>>>,
+    pub counter_set: Option<Rc<Vec<(String, i32)>>>,
     pub opacity: f32,
     /// `transform` / `transform-origin`, resolved at draw time (they depend on the box size)
     pub transform_fn: Option<Rc<str>>,
@@ -298,12 +334,11 @@ impl Style {
             border_color: [None; 4],
             radius: [0.0; 4],
             background: None,
-            gradient: None,
-            bg_image: None,
-            bg_size: BgSize::Auto,
-            bg_position: (Len::Pct(0.0), Len::Pct(0.0)),
-            bg_repeat: (true, true),
+            bg: None,
             shadows: None,
+            counter_reset: None,
+            counter_increment: None,
+            counter_set: None,
             opacity: 1.0,
             transform_fn: None,
             transform_origin: None,
@@ -768,6 +803,77 @@ pub fn position(v: &str, em: f32, rem: f32) -> (Len, Len) {
     (x, y)
 }
 
+fn bg_mut(s: &mut Style) -> &mut Background {
+    Rc::make_mut(s.bg.get_or_insert_with(Default::default))
+}
+
+fn box_area(v: &str) -> Option<BoxArea> {
+    Some(match v {
+        "border-box" => BoxArea::Border,
+        "padding-box" => BoxArea::Padding,
+        "content-box" => BoxArea::Content,
+        _ => return None,
+    })
+}
+
+/// `name [n] name2 [n]...` / `none`
+fn counter_list(v: &str, default: i32) -> Option<Rc<Vec<(String, i32)>>> {
+    if v.trim() == "none" {
+        return Some(Rc::new(Vec::new()));
+    }
+    let mut out: Vec<(String, i32)> = Vec::new();
+    for w in v.split_whitespace() {
+        match (w.parse::<i32>(), out.last_mut()) {
+            (Ok(n), Some(last)) => last.1 = n,
+            (Ok(_), None) => return None,
+            (Err(_), _) => out.push((w.to_string(), default)),
+        }
+    }
+    Some(Rc::new(out))
+}
+
+/// A counter value in a list style: `decimal`, `lower-alpha`, `upper-roman`, `disc`...
+pub fn format_counter(n: i32, style: &str) -> String {
+    let alpha = |n: i32, base: u8| {
+        if n < 1 {
+            return n.to_string();
+        }
+        let (mut n, mut s) = (n as u32, Vec::new());
+        while n > 0 {
+            n -= 1;
+            s.push((base + (n % 26) as u8) as char);
+            n /= 26;
+        }
+        s.iter().rev().collect::<String>()
+    };
+    let roman = |n: i32| {
+        if !(1..4000).contains(&n) {
+            return n.to_string();
+        }
+        let (mut n, mut s) = (n, String::new());
+        for (v, r) in [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
+            while n >= v {
+                s.push_str(r);
+                n -= v;
+            }
+        }
+        s
+    };
+    match style {
+        "none" => String::new(),
+        "disc" => "•".into(),
+        "circle" => "◦".into(),
+        "square" => "▪".into(),
+        "decimal-leading-zero" => format!("{n:02}"),
+        "lower-alpha" | "lower-latin" => alpha(n, b'a'),
+        "upper-alpha" | "upper-latin" => alpha(n, b'A'),
+        "lower-greek" if (1..=24).contains(&n) => char::from_u32(0x3B1 + n as u32 - 1 + if n > 17 { 1 } else { 0 }).map(String::from).unwrap_or_default(),
+        "lower-roman" => roman(n),
+        "upper-roman" => roman(n).to_uppercase(),
+        _ => n.to_string(),
+    }
+}
+
 /// `url(x)`, `url("x")` -> x
 pub fn url(v: &str) -> Option<String> {
     let inner = v.trim().strip_prefix("url(").or_else(|| v.trim().strip_prefix("URL("))?.strip_suffix(')')?;
@@ -893,7 +999,7 @@ pub fn transform_matrix(v: &str, w: f32, h: f32, em: f32) -> Option<[f32; 6]> {
 }
 
 /// `content` of a pseudo-element: strings, `attr(x)`, quotes. None = no box (`none`, `normal`, invalid).
-pub fn content(v: &str, attr: impl Fn(&str) -> Option<String>) -> Option<String> {
+pub fn content(v: &str, attr: impl Fn(&str) -> Option<String>, counter: impl Fn(&str, Option<&str>, &str) -> String) -> Option<String> {
     let mut out = String::new();
     let mut chars = v.trim().chars().peekable();
     let mut any = false;
@@ -943,7 +1049,19 @@ pub fn content(v: &str, attr: impl Fn(&str) -> Option<String>) -> Option<String>
                     "close-quote" => out.push('”'),
                     "no-open-quote" | "no-close-quote" => {}
                     _ if w.starts_with("attr(") => out.push_str(&attr(w[5..].trim_end_matches(')').trim()).unwrap_or_default()),
-                    _ if w.starts_with("counter") => {} // counters unsupported: empty
+                    _ if w.starts_with("counter(") || w.starts_with("counters(") => {
+                        // counter(name[, style]) / counters(name, "sep"[, style])
+                        let multi = w.starts_with("counters(");
+                        let inner = word[if multi { 9 } else { 8 }..].trim_end_matches(')');
+                        let args: Vec<&str> = crate::css::split_top_level(inner, ',').map(str::trim).collect();
+                        let name = args.first().copied().unwrap_or("");
+                        let (sep, style) = if multi {
+                            (args.get(1).map(|s| s.trim_matches(|c| c == '"' || c == '\'')), args.get(2).copied().unwrap_or("decimal"))
+                        } else {
+                            (None, args.get(1).copied().unwrap_or("decimal"))
+                        };
+                        out.push_str(&counter(name, sep, &style.to_ascii_lowercase()));
+                    }
                     _ => return None,
                 }
                 any = true;
@@ -1217,11 +1335,9 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
         }
         "background-color" => s.background = css_color(v, s.color).filter(|c| c.3 > 0),
         "background" => {
-            // the color, the first gradient and the first url() image with its size / position / repeat
+            // layers: image (url / gradient), position / size, repeat, origin / clip; the color in the last one
             s.background = None;
-            s.gradient = None;
-            s.bg_image = None;
-            (s.bg_size, s.bg_position, s.bg_repeat) = (BgSize::Auto, (Len::Pct(0.0), Len::Pct(0.0)), (true, true));
+            let mut bg = Background::default();
             for layer in crate::css::split_top_level(v, ',') {
                 let (pos_part, size_part) = split_slash(layer);
                 // after the `/`: one or two size words, then the layer goes on (`/ cover no-repeat`)
@@ -1235,56 +1351,64 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                         rest.push(w);
                     }
                 }
-                let mut pos_words = Vec::new();
-                let mut has_image = false;
+                let (mut pos_words, mut image, mut rep, mut boxes) = (Vec::new(), None, (true, true), Vec::new());
                 for word in split_values(pos_part).into_iter().chain(rest) {
                     let lw = word.to_ascii_lowercase();
                     if lw.contains("gradient(") {
-                        if s.gradient.is_none() {
-                            s.gradient = gradient(&word, em, rem, s.color).map(Rc::new);
-                        }
+                        image = gradient(&word, em, rem, s.color).map(|g| BgSource::Gradient(Rc::new(g)));
                     } else if lw.starts_with("url(") {
-                        if s.bg_image.is_none() {
-                            s.bg_image = url(&word).map(Rc::from);
-                            has_image = true;
-                        }
+                        image = url(&word).map(|u| BgSource::Url(u.into()));
                     } else if let Some(r) = repeat(&lw) {
-                        s.bg_repeat = r;
-                    } else if matches!(lw.as_str(), "fixed" | "scroll" | "local" | "border-box" | "padding-box" | "content-box" | "text" | "none") {
+                        rep = r;
+                    } else if let Some(b) = box_area(&lw) {
+                        boxes.push(b);
+                    } else if matches!(lw.as_str(), "fixed" | "scroll" | "local" | "text" | "none") {
                     } else if let Some(c) = css_color(&word, s.color) {
                         s.background = Some(c).filter(|c| c.3 > 0);
                     } else {
                         pos_words.push(word);
                     }
                 }
-                if has_image {
-                    if !pos_words.is_empty() {
-                        s.bg_position = position(&pos_words.join(" "), em, rem);
-                    }
-                    if let Some(size) = (!size_words.is_empty()).then(|| bg_size(&size_words.join(" "), em, rem)).flatten() {
-                        s.bg_size = size;
-                    }
+                if let Some(image) = image {
+                    bg.images.push(image);
+                    bg.positions.push(if pos_words.is_empty() { (Len::Pct(0.0), Len::Pct(0.0)) } else { position(&pos_words.join(" "), em, rem) });
+                    bg.sizes.push((!size_words.is_empty()).then(|| bg_size(&size_words.join(" "), em, rem)).flatten().unwrap_or(BgSize::Auto));
+                    bg.repeats.push(rep);
+                    bg.origins.push(boxes.first().copied().unwrap_or(BoxArea::Padding));
+                    bg.clips.push(boxes.get(1).or(boxes.first()).copied().unwrap_or(BoxArea::Border));
                 }
             }
+            s.bg = (!bg.images.is_empty()).then(|| Rc::new(bg));
         }
         "background-image" => {
-            s.gradient = crate::css::split_top_level(v, ',').find_map(|l| gradient(l, em, rem, s.color)).map(Rc::new);
-            s.bg_image = crate::css::split_top_level(v, ',').find_map(|l| url(l.trim())).map(Rc::from);
+            let images: Vec<BgSource> = crate::css::split_top_level(v, ',')
+                .filter_map(|l| {
+                    let l = l.trim();
+                    if l.to_ascii_lowercase().contains("gradient(") {
+                        gradient(l, em, rem, s.color).map(|g| BgSource::Gradient(Rc::new(g)))
+                    } else {
+                        url(l).map(|u| BgSource::Url(u.into()))
+                    }
+                })
+                .collect();
+            bg_mut(s).images = images;
         }
-        "background-size" => {
-            if let Some(size) = crate::css::split_top_level(v, ',').next().and_then(|l| bg_size(l, em, rem)) {
-                s.bg_size = size;
-            }
-        }
-        "background-position" => s.bg_position = position(crate::css::split_top_level(v, ',').next().unwrap_or(""), em, rem),
+        "background-size" => bg_mut(s).sizes = crate::css::split_top_level(v, ',').filter_map(|l| bg_size(l, em, rem)).collect(),
+        "background-position" => bg_mut(s).positions = crate::css::split_top_level(v, ',').map(|l| position(l, em, rem)).collect(),
         "background-repeat" => {
-            let first = crate::css::split_top_level(&lv, ',').next().unwrap_or("").trim().to_string();
-            match first.split_whitespace().collect::<Vec<_>>().as_slice() {
-                [one] => s.bg_repeat = repeat(one).unwrap_or(s.bg_repeat),
-                [x, y] => s.bg_repeat = (*x != "no-repeat", *y != "no-repeat"),
-                _ => {}
-            }
+            bg_mut(s).repeats = crate::css::split_top_level(&lv, ',')
+                .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>().as_slice() {
+                    [one] => repeat(one),
+                    [x, y] => Some((*x != "no-repeat", *y != "no-repeat")),
+                    _ => None,
+                })
+                .collect()
         }
+        "background-origin" => bg_mut(s).origins = crate::css::split_top_level(&lv, ',').filter_map(|l| box_area(l.trim())).collect(),
+        "background-clip" => bg_mut(s).clips = crate::css::split_top_level(&lv, ',').filter_map(|l| box_area(l.trim())).collect(),
+        "counter-reset" => s.counter_reset = counter_list(&lv, 0),
+        "counter-increment" => s.counter_increment = counter_list(&lv, 1),
+        "counter-set" => s.counter_set = counter_list(&lv, 0),
         "box-shadow" => s.shadows = if lv == "none" { None } else { shadows(v, em, rem, s.color).map(Rc::new) },
         "direction" => s.rtl = lv == "rtl",
         "content" => s.content = Some(v.trim().into()),
@@ -1363,7 +1487,12 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
             }
         }
         "list-style" | "list-style-type" => {
-            if let Some(t) = split_values(&lv).into_iter().find(|p| !matches!(p.as_str(), "inside" | "outside") && !p.starts_with("url(")) {
+            // a string marker (`"→ "`) keeps its spaces and case
+            if let Some(q) = v.find(['"', '\'']) {
+                if let Some(end) = v[q + 1..].find(&v[q..q + 1]) {
+                    s.list_style = v[q..q + end + 2].into();
+                }
+            } else if let Some(t) = split_values(&lv).into_iter().find(|p| !matches!(p.as_str(), "inside" | "outside") && !p.starts_with("url(")) {
                 s.list_style = t.into();
             }
         }
@@ -1450,7 +1579,11 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                 "super" => VAlign::Super,
                 "text-top" => VAlign::TextTop,
                 "text-bottom" => VAlign::TextBottom,
-                _ => VAlign::Baseline,
+                _ => match len(&lv, em, rem) {
+                    Some(Len::Px(px)) => VAlign::Length(px),
+                    Some(Len::Pct(p)) => VAlign::Length(s.line_height_px() * p / 100.0),
+                    _ => VAlign::Baseline,
+                },
             }
         }
         "object-fit" => {
@@ -1602,7 +1735,7 @@ mod tests {
         assert!(gradient("repeating-linear-gradient(red 0, blue 10px)", 12.0, 12.0, black).unwrap().repeating);
         assert!(gradient("linear-gradient(red)", 12.0, 12.0, black).is_none());
         let s = computed("background: #eee linear-gradient(red, blue)");
-        assert!(s.gradient.is_some() && s.background == Some(Rgba(238, 238, 238, 255)));
+        assert!(matches!(s.bg.as_ref().unwrap().images[0], BgSource::Gradient(_)) && s.background == Some(Rgba(238, 238, 238, 255)));
     }
 
     #[test]
@@ -1618,27 +1751,56 @@ mod tests {
     }
 
     #[test]
+    fn counters_and_vertical_align() {
+        let s = computed("counter-reset: chapter section 3; counter-increment: section -1; vertical-align: 3px");
+        assert_eq!(s.counter_reset.as_deref(), Some(&vec![("chapter".to_string(), 0), ("section".to_string(), 3)]));
+        assert_eq!(s.counter_increment.as_deref(), Some(&vec![("section".to_string(), -1)]));
+        assert_eq!(s.vertical_align, VAlign::Length(3.0));
+        assert_eq!(format_counter(4, "upper-roman"), "IV");
+        assert_eq!(format_counter(28, "lower-alpha"), "ab");
+        assert_eq!(format_counter(7, "decimal-leading-zero"), "07");
+        assert_eq!(computed("list-style-type: '→ '").list_style.as_ref(), "'→ '");
+    }
+
+    #[test]
     fn generated_content() {
         let attr = |a: &str| (a == "href").then(|| "https://x.test".to_string());
-        assert_eq!(content(r#""(" attr(href) ")""#, attr).as_deref(), Some("(https://x.test)"));
-        assert_eq!(content(r#""\201C" open-quote 'a\'b'"#, attr).as_deref(), Some("\u{201C}“a'b"));
-        assert_eq!(content("\"\"", attr).as_deref(), Some(""));
-        assert_eq!(content("none", attr), None);
-        assert_eq!(content("counter(item) \". \"", attr).as_deref(), Some(". "));
+        let counter = |name: &str, sep: Option<&str>, style: &str| match sep {
+            Some(sep) => [1, 2].map(|n| format_counter(n, style)).join(sep),
+            None => format!("{name}:{}", format_counter(3, style)),
+        };
+        assert_eq!(content(r#""(" attr(href) ")""#, attr, counter).as_deref(), Some("(https://x.test)"));
+        assert_eq!(content(r#""\201C" open-quote 'a\'b'"#, attr, counter).as_deref(), Some("\u{201C}“a'b"));
+        assert_eq!(content("\"\"", attr, counter).as_deref(), Some(""));
+        assert_eq!(content("none", attr, counter), None);
+        assert_eq!(content("counter(item) \". \"", attr, counter).as_deref(), Some("item:3. "));
+        assert_eq!(content("counter(item, upper-roman)", attr, counter).as_deref(), Some("item:III"));
+        assert_eq!(content("counters(item, \".\") \" \"", attr, counter).as_deref(), Some("1.2 "));
     }
 
     #[test]
     fn backgrounds_and_shadows() {
         let s = computed("background: #fff url('img/a.png') no-repeat right 10px top / 50% auto");
-        assert_eq!(s.bg_image.as_deref(), Some("img/a.png"));
+        let bg = s.bg.clone().unwrap();
+        assert_eq!(bg.images, vec![BgSource::Url("img/a.png".into())]);
         assert_eq!(s.background, Some(Rgba(255, 255, 255, 255)));
-        assert_eq!(s.bg_repeat, (false, false));
-        assert_eq!(s.bg_size, BgSize::Size(Len::Pct(50.0), Len::Auto));
-        assert_eq!(s.bg_position, (Len::Calc(-10.0, 100.0), Len::Pct(0.0)));
+        assert_eq!(bg.repeats, vec![(false, false)]);
+        assert_eq!(bg.sizes, vec![BgSize::Size(Len::Pct(50.0), Len::Auto)]);
+        assert_eq!(bg.positions, vec![(Len::Calc(-10.0, 100.0), Len::Pct(0.0))]);
         let s = computed("background: #222 url(a.png) center / contain no-repeat");
-        assert_eq!((s.bg_size, s.bg_repeat, s.background), (BgSize::Contain, (false, false), Some(Rgba(34, 34, 34, 255))));
+        let bg = s.bg.clone().unwrap();
+        assert_eq!((bg.sizes[0], bg.repeats[0], s.background), (BgSize::Contain, (false, false), Some(Rgba(34, 34, 34, 255))));
         let s = computed("background-image: url(a.png); background-size: cover; background-position: center; background-repeat: repeat-x");
-        assert_eq!((s.bg_size, s.bg_position, s.bg_repeat), (BgSize::Cover, (Len::Pct(50.0), Len::Pct(50.0)), (true, false)));
+        let bg = s.bg.clone().unwrap();
+        assert_eq!((bg.sizes[0], bg.positions[0], bg.repeats[0]), (BgSize::Cover, (Len::Pct(50.0), Len::Pct(50.0)), (true, false)));
+        // several layers, cycled lists, origin / clip
+        let s = computed("background: url(a.png) no-repeat content-box, linear-gradient(red, blue) padding-box border-box, #eee");
+        let bg = s.bg.clone().unwrap();
+        assert_eq!(bg.images.len(), 2);
+        assert_eq!((bg.origins.clone(), bg.clips.clone()), (vec![BoxArea::Content, BoxArea::Padding], vec![BoxArea::Content, BoxArea::Border]));
+        let s = computed("background-image: url(a.png), url(b.png), url(c.png); background-repeat: no-repeat, repeat");
+        let bg = s.bg.clone().unwrap();
+        assert_eq!(Background::nth(&bg.repeats, 2, (true, true)), (false, false));
         let s = computed("color: red; box-shadow: 0 2px 4px rgba(0, 0, 0, .5), inset 1px 1px blue, 3px 3px 0 2px");
         let sh = s.shadows.unwrap();
         assert_eq!(sh[0], Shadow { dx: 0.0, dy: 2.0, blur: 4.0, spread: 0.0, color: Rgba(0, 0, 0, 128), inset: false });

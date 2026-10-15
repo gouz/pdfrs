@@ -1,0 +1,29 @@
+@page { size: A5; margin: 20mm 15mm;
+  @top-left { content: "Rapport annuel"; font-size: 8px; color: #888 }
+  @top-right { content: "Confidentiel"; font-size: 8px; color: #c0392b }
+  @bottom-center { content: "Page " counter(page) " sur " counter(pages); font-size: 8px; color: #888 }
+}
+@page :first { margin-top: 35mm; @top-left { content: "" } @top-right { content: "" } }
+body { font-family: Georgia, serif; font-size: 10px; color: #222; counter-reset: chapter }
+h1 { font-family: sans-serif; color: #2c6fbb; text-align: center; margin-bottom: 18px }
+h2 { font-family: sans-serif; font-size: 12px; counter-increment: chapter; counter-reset: section; margin: 14px 0 6px }
+h2::before { content: counter(chapter, upper-roman) ". "; color: #2c6fbb }
+h3 { font-family: sans-serif; font-size: 10px; counter-increment: section; margin: 8px 0 4px }
+h3::before { content: counter(chapter) "." counter(section) " "; color: #888 }
+p.intro::first-letter { font-size: 2.4em; color: #2c6fbb; font-weight: bold }
+ol.steps { list-style: none; counter-reset: step; padding-left: 26px }
+ol.steps li { counter-increment: step; margin: 3px 0 }
+ol.steps li::before { content: counter(step); display: inline-block; width: 14px; margin-left: -22px; margin-right: 8px; text-align: center; background: #2c6fbb; color: white; border-radius: 7px; font-size: 8px; font-family: sans-serif }
+ul.check li::marker { content: "✓ "; color: #2a9d5c }
+ol.nested { counter-reset: item; list-style: none }
+ol.nested li { counter-increment: item }
+ol.nested li::before { content: counters(item, ".") " "; color: #888; font-family: sans-serif }
+.layers { height: 60px; border: 6px dashed rgba(44, 111, 187, .5); padding: 8px; color: white; font-family: sans-serif;
+  background: linear-gradient(rgba(0,0,0,.35), rgba(0,0,0,0)) content-box, url(logo.png) right 4px center / 40px no-repeat padding-box, linear-gradient(90deg, #2c6fbb, #6bc1ff) border-box }
+.inset { margin-top: 10px; padding: 10px; background: #f6f8fa; border-radius: 6px; box-shadow: inset 0 2px 6px rgba(0,0,0,.35) }
+.raise { vertical-align: 4px; font-size: 7px; color: #c0392b }
+table { width: 100%; border-collapse: collapse; font-family: sans-serif; font-size: 8px; margin-top: 10px }
+th { background: #2c3e50; color: white; padding: 3px }
+tfoot td { background: #eef4fb; font-weight: bold }
+td { border-bottom: 1px solid #ddd; padding: 2px 4px }
+td.n { text-align: right }

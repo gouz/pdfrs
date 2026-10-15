@@ -3,7 +3,7 @@
 use crate::css::{self, Decl, Media, Pseudo, Rule, Sheet};
 use crate::fonts;
 use crate::images::{self, ImagePolicy};
-use crate::style::{self, BgSize, BorderStyle, Display, Gradient, Len, ObjectFit, Rgba, Shadow, Style, TextAlign, Transform, VAlign, WhiteSpace};
+use crate::style::{self, Background, BgSize, BgSource, BorderStyle, BoxArea, Display, Gradient, Len, ObjectFit, Rgba, Shadow, Style, TextAlign, Transform, VAlign, WhiteSpace};
 use ego_tree::NodeRef;
 use parley::{FontContext, LayoutContext, StyleProperty, TextStyle};
 use scraper::{ElementRef, Html, Node};
@@ -101,18 +101,26 @@ pub enum Leaf {
     Image(ImageLeaf),
 }
 
-/// A `background-image: url()` layer, decoded.
+/// What a background layer paints.
+pub enum LayerPaint {
+    Gradient(Rc<Gradient>),
+    /// decoded image, natural size
+    Image(ImageKind, (f32, f32)),
+}
+
+/// A background layer, ready to draw.
 pub struct BgLayer {
-    pub kind: ImageKind,
-    pub natural: (f32, f32),
+    pub paint: LayerPaint,
     pub size: BgSize,
     pub position: (Len, Len),
     pub repeat: (bool, bool),
+    pub origin: BoxArea,
+    pub clip: BoxArea,
 }
 
 impl std::fmt::Debug for BgLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BgLayer({:?}, {:?})", self.natural, self.size)
+        write!(f, "BgLayer({:?}, {:?}, {:?})", self.size, self.origin, self.clip)
     }
 }
 
@@ -129,8 +137,10 @@ pub struct Deco {
     pub break_before: bool,
     pub break_after: bool,
     pub avoid_break_inside: bool,
-    pub gradient: Option<Rc<Gradient>>,
-    pub bg_image: Option<Rc<BgLayer>>,
+    /// background image layers, first on top
+    pub layers: Vec<Rc<BgLayer>>,
+    /// the background color's clip: the last layer's background-clip
+    pub color_clip: BoxArea,
     pub shadows: Option<Rc<Vec<Shadow>>>,
     /// `transform`, `transform-origin`, font size (for em units)
     pub transform: Option<(Rc<str>, Option<Rc<str>>, f32)>,
@@ -140,8 +150,7 @@ impl Deco {
     /// anything to draw or to take into account when paginating
     fn needed(&self) -> bool {
         self.background.is_some()
-            || self.gradient.is_some()
-            || self.bg_image.is_some()
+            || !self.layers.is_empty()
             || self.shadows.is_some()
             || self.border_width.iter().any(|w| *w > 0.0)
             || self.opacity < 1.0
@@ -178,6 +187,8 @@ pub struct Tree {
     inline: Vec<(NodeId, NodeId)>,
     /// table -> its <thead> cells, repeated at the top of the pages the table continues on
     pub headers: HashMap<NodeId, Vec<NodeId>>,
+    /// table -> its <tfoot> cells, repeated at the bottom of the pages the table breaks on
+    pub footers: HashMap<NodeId, Vec<NodeId>>,
     /// table cells: not split across pages when they fit on one
     pub cells: std::collections::HashSet<NodeId>,
 }
@@ -206,15 +217,18 @@ struct Builder<'a> {
     links: Vec<String>,
     fcx: &'a mut FontContext,
     lcx: &'a mut LayoutContext<Brush>,
-    /// next list item number of each open list
-    counters: Vec<i32>,
+    /// CSS counters: name -> nested instances (innermost last)
+    counters: HashMap<String, Vec<i32>>,
     /// nesting of boxes and of walk() calls: bounded, so hostile HTML cannot overflow the stack
     box_depth: usize,
     walk_depth: usize,
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
     inline: Vec<(NodeId, NodeId)>,
     headers: HashMap<NodeId, Vec<NodeId>>,
+    footers: HashMap<NodeId, Vec<NodeId>>,
     cells: std::collections::HashSet<NodeId>,
+    /// `::first-letter` style waiting for the first letter of the current block
+    first_letter: Option<Rc<Style>>,
     /// decoded background images by url (the same image is often repeated on many boxes)
     bg_images: HashMap<Rc<str>, Option<(ImageKind, (f32, f32))>>,
 }
@@ -224,19 +238,32 @@ const MAX_BOX_DEPTH: usize = 100;
 const MAX_WALK_DEPTH: usize = 400;
 
 /// The <style> sheets of a document, for a given medium.
-pub fn stylesheet(doc: &Html, media: &Media) -> Sheet {
+/// `<link rel="stylesheet" href>` are read from the image directory only (never from the network).
+pub fn stylesheet(doc: &Html, media: &Media, policy: &ImagePolicy) -> Sheet {
     let mut sheet = Sheet::default();
-    let style_sel = scraper::Selector::parse("style").unwrap();
-    for s in doc.select(&style_sel) {
-        if s.value().attr("media").is_none_or(|m| css::media_matches(m, media)) {
+    let sel = scraper::Selector::parse("style, link").unwrap();
+    for s in doc.select(&sel) {
+        if !s.value().attr("media").is_none_or(|m| css::media_matches(m, media)) {
+            continue;
+        }
+        if s.value().name() == "style" {
             css::parse_stylesheet(&s.text().collect::<String>(), media, &mut sheet);
+        } else if s.value().attr("rel").is_some_and(|r| r.split_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet"))) {
+            let href = s.value().attr("href").unwrap_or("");
+            match images::resolve(href, policy) {
+                Some(images::Source::File(f)) => match std::fs::read(&f) {
+                    Ok(css) => css::parse_stylesheet(&String::from_utf8_lossy(&css), media, &mut sheet),
+                    Err(e) => eprintln!("pdfrs: stylesheet {href:?}: {e}"),
+                },
+                _ => eprintln!("pdfrs: stylesheet blocked or not found: {}", href.chars().take(80).collect::<String>()),
+            }
         }
     }
     sheet
 }
 
 /// Load the @font-face fonts a sheet declares: `data:` URLs, or files of the image directory.
-/// TrueType / OpenType only (WOFF and WOFF2 are skipped with a warning).
+/// TrueType, OpenType, WOFF and WOFF2.
 pub fn load_font_faces(faces: &[Vec<Decl>], policy: &ImagePolicy) -> Vec<fonts::DocFace> {
     let mut out = Vec::new();
     for decls in faces {
@@ -269,12 +296,11 @@ pub fn load_font_faces(faces: &[Vec<Decl>], policy: &ImagePolicy) -> Vec<fonts::
                     images::Source::Data(d) => d,
                 }
             };
-            if fonts::is_sfnt(&data) {
-                Some(data)
-            } else {
-                eprintln!("pdfrs: @font-face {family:?}: only TrueType / OpenType fonts are supported (not WOFF / WOFF2)");
-                None
+            let sfnt = fonts::to_sfnt(data);
+            if sfnt.is_none() {
+                eprintln!("pdfrs: @font-face {family:?}: not a TrueType / OpenType / WOFF / WOFF2 font");
             }
+            sfnt
         });
         if let Some(data) = data {
             out.push(fonts::DocFace { family, data: parley::fontique::Blob::new(Arc::new(data)), weight, italic });
@@ -296,13 +322,15 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             links: Vec::new(),
             fcx,
             lcx,
-            counters: Vec::new(),
+            counters: HashMap::new(),
             box_depth: 0,
             walk_depth: 0,
             calc: Vec::new(),
             inline: Vec::new(),
             headers: HashMap::new(),
+            footers: HashMap::new(),
             cells: Default::default(),
+            first_letter: None,
             bg_images: HashMap::new(),
         };
         b.taffy.disable_rounding();
@@ -317,9 +345,10 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.display = Display::Block;
         body_style.size[0] = Len::Px(width);
         body_style.background = body_style.background.or(html_style.background);
-        body_style.gradient = body_style.gradient.clone().or(html_style.gradient.clone());
+        body_style.bg = body_style.bg.clone().or(html_style.bg.clone());
+        b.apply_counters(body, &body_style, &mut Vec::new());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, cells: b.cells }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, footers: b.footers, cells: b.cells }
     })
 }
 
@@ -349,38 +378,16 @@ fn apply_transform(t: &str, tr: Transform) -> String {
     }
 }
 
-fn marker(kind: &str, n: i32) -> Option<String> {
-    let alpha = |n: i32, base: u8| {
-        let (mut n, mut s) = (n.max(1) as u32, Vec::new());
-        while n > 0 {
-            n -= 1;
-            s.push((base + (n % 26) as u8) as char);
-            n /= 26;
-        }
-        s.iter().rev().collect::<String>()
-    };
-    let roman = |mut n: i32| {
-        let mut s = String::new();
-        for (v, r) in [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
-            while n >= v {
-                s.push_str(r);
-                n -= v;
-            }
-        }
-        s
-    };
-    Some(match kind {
-        "none" => return None,
-        "circle" => "◦".into(),
-        "square" => "▪".into(),
-        "decimal" => format!("{n}."),
-        "decimal-leading-zero" => format!("{n:02}."),
-        "lower-alpha" | "lower-latin" => format!("{}.", alpha(n, b'a')),
-        "upper-alpha" | "upper-latin" => format!("{}.", alpha(n, b'A')),
-        "lower-roman" => format!("{}.", roman(n)),
-        "upper-roman" => format!("{}.", roman(n).to_uppercase()),
-        _ => "•".into(),
-    })
+/// Default marker text of a list item (`disc` -> "•", `decimal` -> "3.", `"→ "` -> "→ ").
+fn default_marker(kind: &str, n: i32) -> Option<String> {
+    if let Some(q) = kind.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        return Some(kind.trim_matches(q).to_string());
+    }
+    match kind {
+        "none" => None,
+        "disc" | "circle" | "square" => Some(style::format_counter(n, kind)),
+        _ => Some(format!("{}.", style::format_counter(n, kind))),
+    }
 }
 
 /// parley text style of a run
@@ -415,7 +422,7 @@ fn text_style(s: &Style, brush: Brush) -> TextStyle<'static, 'static, Brush> {
         text_wrap_mode: wrap,
         overflow_wrap: parley::OverflowWrap::BreakWord,
         // only shifts apply to text runs (top / middle / bottom are for boxes and table cells)
-        vertical_align: if matches!(s.vertical_align, VAlign::Sub | VAlign::Super) { valign(s.vertical_align) } else { parley::VerticalAlign::BASELINE },
+        vertical_align: if matches!(s.vertical_align, VAlign::Sub | VAlign::Super | VAlign::Length(_)) { valign(s.vertical_align) } else { parley::VerticalAlign::BASELINE },
         ..TextStyle::default()
     }
 }
@@ -430,6 +437,7 @@ fn valign(v: VAlign) -> parley::VerticalAlign {
         VAlign::Super => parley::VerticalAlign::SUPER,
         VAlign::TextTop => parley::VerticalAlign::TEXT_TOP,
         VAlign::TextBottom => parley::VerticalAlign::TEXT_BOTTOM,
+        VAlign::Length(px) => parley::VerticalAlign::length(px),
     }
 }
 
@@ -522,9 +530,9 @@ fn deco_of(s: &Style) -> Deco {
         break_before: s.break_before,
         break_after: s.break_after,
         avoid_break_inside: s.break_inside_avoid,
-        gradient: s.gradient.clone(),
         transform: s.transform_fn.clone().map(|t| (t, s.transform_origin.clone(), s.font_size)),
-        bg_image: None,
+        layers: Vec::new(),
+        color_clip: s.bg.as_ref().map_or(BoxArea::Border, |b| Background::nth(&b.clips, b.images.len().max(1) - 1, BoxArea::Border)),
         shadows: s.shadows.clone(),
     }
 }
@@ -589,20 +597,36 @@ impl Builder<'_> {
     /// Decoration and calc() fix-ups of a new element node.
     fn finish_node(&mut self, node: NodeId, s: &Style) {
         let mut d = deco_of(s);
-        if let Some(url) = &s.bg_image {
-            let policy = self.policy;
-            let decoded = self
-                .bg_images
-                .entry(url.clone())
-                .or_insert_with(|| {
-                    let img = images::load(url, policy).and_then(decode);
-                    if img.is_none() {
-                        eprintln!("pdfrs: background image blocked or not found: {}", url.chars().take(80).collect::<String>());
+        if let Some(bg) = &s.bg {
+            for (i, src) in bg.images.iter().enumerate() {
+                let paint = match src {
+                    BgSource::Gradient(g) => LayerPaint::Gradient(g.clone()),
+                    BgSource::Url(url) => {
+                        let policy = self.policy;
+                        let decoded = self
+                            .bg_images
+                            .entry(url.clone())
+                            .or_insert_with(|| {
+                                let img = images::load(url, policy).and_then(decode);
+                                if img.is_none() {
+                                    eprintln!("pdfrs: background image blocked or not found: {}", url.chars().take(80).collect::<String>());
+                                }
+                                img
+                            })
+                            .clone();
+                        let Some((kind, natural)) = decoded else { continue };
+                        LayerPaint::Image(kind, natural)
                     }
-                    img
-                })
-                .clone();
-            d.bg_image = decoded.map(|(kind, natural)| Rc::new(BgLayer { kind, natural, size: s.bg_size, position: s.bg_position, repeat: s.bg_repeat }));
+                };
+                d.layers.push(Rc::new(BgLayer {
+                    paint,
+                    size: Background::nth(&bg.sizes, i, BgSize::Auto),
+                    position: Background::nth(&bg.positions, i, (Len::Pct(0.0), Len::Pct(0.0))),
+                    repeat: Background::nth(&bg.repeats, i, (true, true)),
+                    origin: Background::nth(&bg.origins, i, BoxArea::Padding),
+                    clip: Background::nth(&bg.clips, i, BoxArea::Border),
+                }));
+            }
         }
         if d.needed() {
             self.deco.insert(node, d);
@@ -614,6 +638,7 @@ impl Builder<'_> {
     }
 
     /// `::before` / `::after` content of `el`: inline text in the current group, or its own box.
+    #[inline(never)]
     fn pseudo(&mut self, el: ElementRef, s: &Rc<Style>, which: Pseudo, brush: &Brush, ctx: &mut Ctx, container: &Rc<Style>) {
         if !self.sheet.has_pseudo && el.value().name() != "q" {
             return;
@@ -623,7 +648,7 @@ impl Builder<'_> {
             return;
         }
         let ps = Style::compute(s, &decls, self.rem);
-        let Some(text) = ps.content.as_deref().and_then(|c| style::content(c, |a| attr(&el, a).map(String::from))) else { return };
+        let Some(text) = ps.content.as_deref().and_then(|c| style::content(c, |a| attr(&el, a).map(String::from), |n, sep, st| self.counter_text(n, sep, st))) else { return };
         let text = apply_transform(&text, ps.transform);
         let ps = Rc::new(ps);
         match ps.display {
@@ -661,19 +686,16 @@ impl Builder<'_> {
             return self.build_table(el, s);
         }
         let mut ctx = Ctx { owner: Some(el.id()), ..Ctx::default() };
-        let tag = el.value().name();
-        let is_list = matches!(tag, "ul" | "ol" | "menu" | "dir");
-        if is_list {
-            let start = attr(&el, "start").and_then(|v| v.parse().ok()).unwrap_or(1);
-            self.counters.push(start);
-        }
         if s.display == Display::ListItem {
-            let n = attr(&el, "value").and_then(|v| v.parse().ok()).or_else(|| self.counters.last().copied()).unwrap_or(1);
-            if let Some(c) = self.counters.last_mut() {
-                *c = n + 1;
-            }
-            if let Some(m) = marker(&s.list_style, n) {
-                let mut ms = (*s).clone();
+            let n = self.counters.get("list-item").and_then(|c| c.last()).copied().unwrap_or(1);
+            // ::marker: its style, and its content instead of the list-style-type one
+            let decls = if self.sheet.has_pseudo { css::matched(el, Some(Pseudo::Marker), &UA, &self.sheet.rules, &[]) } else { Vec::new() };
+            let mut ms = if decls.is_empty() { (*s).clone() } else { Style::compute(&s, &decls, self.rem) };
+            let text = match ms.content.as_deref() {
+                Some(c) => style::content(c, |a| attr(&el, a).map(String::from), |n, sep, st| self.counter_text(n, sep, st)),
+                None => default_marker(&s.list_style, n),
+            };
+            if let Some(m) = text {
                 ms.white_space = WhiteSpace::NoWrap;
                 ms.underline = false;
                 ms.strike = false;
@@ -703,12 +725,23 @@ impl Builder<'_> {
             }
         }
         let brush = brush_of(&s);
+        // ::first-letter: styles the first letter of the text that follows (in this box or its first child boxes)
+        let mut owns_first_letter = false;
+        if self.sheet.has_pseudo {
+            let decls = css::matched(el, Some(Pseudo::FirstLetter), &UA, &self.sheet.rules, &[]);
+            if !decls.is_empty() {
+                let mut fl = Style::compute(&s, &decls, self.rem);
+                fl.display = Display::Inline;
+                self.first_letter = Some(Rc::new(fl));
+                owns_first_letter = true;
+            }
+        }
         self.pseudo(el, &s, Pseudo::Before, &brush, &mut ctx, &s);
         self.walk(*el, &s, brush.clone(), &mut ctx, &s);
         self.pseudo(el, &s, Pseudo::After, &brush, &mut ctx, &s);
         self.flush(&mut ctx, &s);
-        if is_list {
-            self.counters.pop();
+        if owns_first_letter {
+            self.first_letter = None;
         }
         let mut ts = to_taffy(&s);
         if s.display == Display::TableCell {
@@ -738,9 +771,11 @@ impl Builder<'_> {
     }
 
     fn walk_children(&mut self, parent: NodeRef<Node>, s: &Rc<Style>, brush: Brush, ctx: &mut Ctx, container: &Rc<Style>) {
+        // counters reset by these children live until the end of the parent (siblings see them)
+        let mut scope = Vec::new();
         for child in parent.children() {
             match child.value() {
-                Node::Text(t) => ctx.group.push(Piece::Text(apply_transform(t, s.transform), s.clone(), brush.clone())),
+                Node::Text(t) => self.text(t, s, &brush, ctx),
                 Node::Element(_) => {
                     let Some(el) = ElementRef::wrap(child) else { continue };
                     let mut cs = self.style_of(el, s);
@@ -748,9 +783,10 @@ impl Builder<'_> {
                         continue;
                     }
                     // sub / sup shift their inline descendants too
-                    if matches!(s.vertical_align, VAlign::Sub | VAlign::Super) && cs.vertical_align == VAlign::Baseline && cs.display == Display::Inline {
+                    if matches!(s.vertical_align, VAlign::Sub | VAlign::Super | VAlign::Length(_)) && cs.vertical_align == VAlign::Baseline && cs.display == Display::Inline {
                         cs.vertical_align = s.vertical_align;
                     }
+                    self.apply_counters(el, &cs, &mut scope);
                     let cs = Rc::new(cs);
                     // children of a flex / grid box are its items, whatever their display (blockified)
                     let item = Some(parent.id()) == ctx.owner && matches!(container.display, Display::Flex | Display::Grid);
@@ -814,6 +850,91 @@ impl Builder<'_> {
                 }
                 _ => {}
             }
+        }
+        self.end_counter_scope(scope);
+    }
+
+    /// A text node into the group; the first letter split off when a ::first-letter waits for it.
+    #[inline(never)]
+    fn text(&mut self, t: &str, s: &Rc<Style>, brush: &Brush, ctx: &mut Ctx) {
+        let text = apply_transform(t, s.transform);
+        let Some(fl) = self.first_letter.take_if(|_| !text.trim().is_empty()) else {
+            ctx.group.push(Piece::Text(text, s.clone(), brush.clone()));
+            return;
+        };
+        // the first letter, with the punctuation around it
+        let start = text.len() - text.trim_start().len();
+        let mut end = start;
+        let mut seen_letter = false;
+        for (i, c) in text[start..].char_indices() {
+            if c.is_alphanumeric() {
+                if seen_letter {
+                    break;
+                }
+                seen_letter = true;
+            } else if !(c.is_ascii_punctuation() || "«»“”‘’„".contains(c)) || seen_letter && !"'’.,;:!?»”".contains(c) {
+                break;
+            }
+            end = start + i + c.len_utf8();
+        }
+        if start > 0 {
+            ctx.group.push(Piece::Text(text[..start].to_string(), s.clone(), brush.clone()));
+        }
+        let b = Brush { color: fl.color, background: fl.background.or(brush.background), link: brush.link };
+        ctx.group.push(Piece::Text(text[start..end].to_string(), fl, b));
+        ctx.group.push(Piece::Text(text[end..].to_string(), s.clone(), brush.clone()));
+    }
+
+    /// CSS counters of an element, in order: counter-reset, counter-set, counter-increment
+    /// (lists reset `list-item`, list items increment it). New instances go into `scope`.
+    #[inline(never)]
+    fn apply_counters(&mut self, el: ElementRef, s: &Style, scope: &mut Vec<String>) {
+        let mut resets = s.counter_reset.as_deref().cloned().unwrap_or_default();
+        let tag = el.value().name();
+        if matches!(tag, "ol" | "ul" | "menu" | "dir") && !resets.iter().any(|r| r.0 == "list-item") {
+            let start: i32 = attr(&el, "start").and_then(|v| v.trim().parse().ok()).unwrap_or(1);
+            resets.push(("list-item".into(), start.saturating_sub(1)));
+        }
+        for (name, v) in resets {
+            self.counters.entry(name.clone()).or_default().push(v);
+            scope.push(name);
+        }
+        let mut sets = s.counter_set.as_deref().cloned().unwrap_or_default();
+        let mut incs = s.counter_increment.as_deref().cloned().unwrap_or_default();
+        if s.display == Display::ListItem && !incs.iter().chain(&sets).any(|c| c.0 == "list-item") {
+            match attr(&el, "value").and_then(|v| v.trim().parse::<i32>().ok()) {
+                Some(v) => sets.push(("list-item".into(), v)),
+                None => incs.push(("list-item".into(), 1)),
+            }
+        }
+        for (name, v, add) in sets.into_iter().map(|(n, v)| (n, v, false)).chain(incs.into_iter().map(|(n, v)| (n, v, true))) {
+            let stack = self.counters.entry(name.clone()).or_default();
+            if stack.is_empty() {
+                stack.push(0);
+                scope.push(name);
+            }
+            let top = stack.last_mut().unwrap();
+            *top = if add { top.saturating_add(v) } else { v };
+        }
+    }
+
+    fn end_counter_scope(&mut self, scope: Vec<String>) {
+        for name in scope {
+            if let Some(stack) = self.counters.get_mut(&name) {
+                stack.pop();
+            }
+        }
+    }
+
+    /// `counter(name, style)` / `counters(name, sep, style)`
+    fn counter_text(&self, name: &str, sep: Option<&str>, style: &str) -> String {
+        let stack = self.counters.get(name).map(Vec::as_slice).unwrap_or(&[]);
+        match sep {
+            Some(sep) => {
+                let all: Vec<String> = if stack.is_empty() { vec![style::format_counter(0, style)] } else { stack.iter().map(|n| style::format_counter(*n, style)).collect() };
+                all.join(sep)
+            }
+            None => style::format_counter(stack.last().copied().unwrap_or(0), style),
         }
     }
 
@@ -925,8 +1046,11 @@ impl Builder<'_> {
     fn build_table(&mut self, el: ElementRef, s: Rc<Style>) -> Option<NodeId> {
         let mut rows: Vec<(ElementRef, Rc<Style>)> = Vec::new();
         let mut captions = Vec::new();
-        let header_rows = self.table_rows(el, &s, &mut rows, &mut captions);
+        let (header_rows, footer_rows) = self.table_rows(el, &s, &mut rows, &mut captions);
         let mut header_cells = Vec::new();
+        let mut footer_cells = Vec::new();
+        let mut scope = Vec::new();
+        let mut last_row = None;
 
         let mut children = Vec::new();
         let mut taken: Vec<Vec<bool>> = Vec::new();
@@ -962,7 +1086,15 @@ impl Builder<'_> {
                 c += colspan;
             }
         }
+        let nrows = rows.len();
         for (cell, mut cs, r, c, rowspan, colspan) in cells {
+            // counters of rows (once per row) and cells, in document order
+            if last_row != Some(r) {
+                last_row = Some(r);
+                let (row, rs) = (rows[r].0, rows[r].1.clone());
+                self.apply_counters(row, &rs, &mut scope);
+            }
+            self.apply_counters(cell, &cs, &mut scope);
             if s.border_collapse {
                 // collapse: neighbours overlap their shared border
                 if c > 0 {
@@ -981,6 +1113,9 @@ impl Builder<'_> {
                 self.cells.insert(n);
                 if r < header_rows {
                     header_cells.push(n);
+                }
+                if r >= nrows - footer_rows {
+                    footer_cells.push(n);
                 }
             }
         }
@@ -1002,14 +1137,18 @@ impl Builder<'_> {
         }
         let node = self.taffy.new_with_children(ts, &children).ok()?;
         self.finish_node(node, &s);
+        self.end_counter_scope(scope);
         if !header_cells.is_empty() {
             self.headers.insert(node, header_cells);
+        }
+        if !footer_cells.is_empty() {
+            self.footers.insert(node, footer_cells);
         }
         Some(node)
     }
 
-    /// Rows of a table (thead first, tfoot last); returns the number of <thead> rows.
-    fn table_rows<'d>(&mut self, el: ElementRef<'d>, s: &Rc<Style>, rows: &mut Vec<(ElementRef<'d>, Rc<Style>)>, captions: &mut Vec<NodeId>) -> usize {
+    /// Rows of a table (thead first, tfoot last); returns the number of <thead> and <tfoot> rows.
+    fn table_rows<'d>(&mut self, el: ElementRef<'d>, s: &Rc<Style>, rows: &mut Vec<(ElementRef<'d>, Rc<Style>)>, captions: &mut Vec<NodeId>) -> (usize, usize) {
         // thead first, tfoot last, like a browser
         let mut groups: [Vec<(ElementRef<'d>, Rc<Style>)>; 3] = Default::default();
         for child in el.children().filter_map(ElementRef::wrap) {
@@ -1040,9 +1179,9 @@ impl Builder<'_> {
                 _ => {}
             }
         }
-        let header_rows = groups[0].len();
+        let (header_rows, footer_rows) = (groups[0].len(), groups[2].len());
         rows.extend(groups.into_iter().flatten());
-        header_rows
+        (header_rows, footer_rows)
     }
 }
 

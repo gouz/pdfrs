@@ -10,7 +10,7 @@ pub mod layout;
 pub mod render;
 pub mod style;
 
-use css::{Decl, Media};
+use css::{Decl, Media, PageRule};
 use krilla::page::PageSettings;
 use scraper::Html;
 use std::cell::RefCell;
@@ -86,7 +86,7 @@ thread_local! {
 fn band(html: &str, page: usize, pages: usize, o: &Options, width: f32, media: &Media, faces: &[fonts::DocFace]) -> layout::Tree {
     let html = html.replace("{page}", &page.to_string()).replace("{pages}", &pages.to_string());
     let doc = Html::parse_document(&html);
-    let sheet = layout::stylesheet(&doc, media);
+    let sheet = layout::stylesheet(&doc, media, &o.images);
     let mut faces = faces.to_vec();
     faces.extend(layout::load_font_faces(&sheet.font_faces, &o.images));
     let mut t = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, width, &mut lcx.borrow_mut()));
@@ -94,27 +94,33 @@ fn band(html: &str, page: usize, pages: usize, o: &Options, width: f32, media: &
     t
 }
 
-/// Page size (landscape applied) and margins: the request's options, else the document's `@page`, else A4 / 40pt.
-fn page_setup(o: &Options, pages: &[Vec<Decl>]) -> ((f32, f32), [f32; 4]) {
-    let (mut size, mut landscape, mut margin) = (None, None, [None; 4]);
+/// What `@page` rules set: size, orientation, margins (each None when not set).
+#[derive(Default, Clone, Copy)]
+struct PageProps {
+    size: Option<(f32, f32)>,
+    landscape: Option<bool>,
+    margin: [Option<f32>; 4],
+}
+
+fn page_props(o: &Options, decls: &[&Decl], mut p: PageProps) -> PageProps {
     let px = |v: &str| style::len(v, o.font_size, o.font_size).and_then(style::Len::px);
-    for d in pages.iter().flatten() {
+    for d in decls {
         let v = d.value.to_ascii_lowercase();
         match d.prop.as_str() {
             "size" => {
                 let dims: Vec<f32> = v.split_whitespace().filter_map(px).collect();
                 match dims[..] {
-                    [a] => size = Some((a, a)),
-                    [a, b] => size = Some((a, b)),
+                    [a] => p.size = Some((a, a)),
+                    [a, b] => p.size = Some((a, b)),
                     _ => {}
                 }
                 for w in v.split_whitespace() {
                     match w {
-                        "landscape" => landscape = Some(true),
-                        "portrait" => landscape = Some(false),
+                        "landscape" => p.landscape = Some(true),
+                        "portrait" => p.landscape = Some(false),
                         w => {
                             if let Some(s) = page_size(w).filter(|_| !w.contains(|c: char| c.is_ascii_digit()) || w.len() <= 3) {
-                                size = Some(s);
+                                p.size = Some(s);
                             }
                         }
                     }
@@ -129,18 +135,64 @@ fn page_setup(o: &Options, pages: &[Vec<Decl>]) -> ((f32, f32), [f32; 4]) {
                     [a, b, c, d] => [a, b, c, d],
                     _ => continue,
                 };
-                margin = m.map(Some);
+                p.margin = m.map(Some);
             }
             "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
-                let i = ["margin-top", "margin-right", "margin-bottom", "margin-left"].iter().position(|p| *p == d.prop).unwrap();
-                margin[i] = px(&v).or(margin[i]);
+                let i = ["margin-top", "margin-right", "margin-bottom", "margin-left"].iter().position(|m| *m == d.prop).unwrap();
+                p.margin[i] = px(&v).or(p.margin[i]);
             }
             _ => {}
         }
     }
-    let (w, h) = o.size.or(size).unwrap_or_else(|| page_size("A4").unwrap());
-    let page = if o.landscape.or(landscape).unwrap_or(false) { (w.max(h), w.min(h)) } else { (w, h) };
-    (page, o.margin.unwrap_or(margin.map(|m| m.unwrap_or(40.0))))
+    p
+}
+
+/// Page size (landscape applied), margins, and the first page's top / bottom margins: the request's
+/// options, else the document's `@page` (and `@page :first`), else A4 / 40pt.
+/// The first page keeps the others' size and side margins (the column has one width).
+fn page_setup(o: &Options, pages: &[PageRule]) -> ((f32, f32), [f32; 4], (f32, f32)) {
+    let decls = |first: bool| pages.iter().filter(|p| p.first == first).flat_map(|p| &p.decls).collect::<Vec<_>>();
+    let base = page_props(o, &decls(false), PageProps::default());
+    let first = page_props(o, &decls(true), base);
+    let (w, h) = o.size.or(base.size).unwrap_or_else(|| page_size("A4").unwrap());
+    let page = if o.landscape.or(base.landscape).unwrap_or(false) { (w.max(h), w.min(h)) } else { (w, h) };
+    let margin = o.margin.unwrap_or(base.margin.map(|m| m.unwrap_or(40.0)));
+    let first_margin = match o.margin {
+        Some(m) => (m[0], m[2]),
+        None => (first.margin[0].unwrap_or(margin[0]), first.margin[2].unwrap_or(margin[2])),
+    };
+    (page, margin, first_margin)
+}
+
+/// The `@page` margin boxes of an edge (`top` / `bottom`) as header / footer HTML: left, center
+/// and right boxes side by side, `counter(page)` / `counter(pages)` as `{page}` / `{pages}`.
+fn margin_band(pages: &[PageRule], first: bool, edge: &str) -> Option<String> {
+    // later rules win, `:first` rules over the others on the first page
+    let mut boxes: Vec<(&str, &[Decl])> = Vec::new();
+    for rule in pages.iter().filter(|p| !p.first).chain(pages.iter().filter(|p| first && p.first)) {
+        for (name, decls) in &rule.boxes {
+            boxes.retain(|b| b.0 != name);
+            boxes.push((name, decls));
+        }
+    }
+    let escape = |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut cells = String::new();
+    let mut any = false;
+    for slot in ["left", "center", "right"] {
+        let name = format!("{edge}-{slot}");
+        let decls = boxes.iter().find(|b| b.0 == name).map(|b| b.1).unwrap_or(&[]);
+        let content = decls.iter().rev().find(|d| d.prop == "content").and_then(|d| {
+            style::content(&d.value, |_| None, |counter, _, _| match counter {
+                "page" => "{page}".into(),
+                "pages" => "{pages}".into(),
+                _ => String::new(),
+            })
+        });
+        let css: String = decls.iter().filter(|d| d.prop != "content").map(|d| format!("{}: {};", d.prop, d.value.replace('"', "&quot;"))).collect();
+        any |= content.is_some();
+        cells.push_str(&format!("<div style=\"flex: 1; text-align: {slot}; {css}\">{}</div>", escape(&content.unwrap_or_default())));
+    }
+    any.then(|| format!("<div style=\"display: flex; align-items: center\">{cells}</div>"))
 }
 
 /// Forgets the document's @font-face fonts, however the render ends.
@@ -157,17 +209,25 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     let doc = Html::parse_document(html);
     // @page first (it can sit in @media print), then the sheets for the real page area
     let provisional = Media { width: 515.28, height: 761.89 };
-    let sheet = layout::stylesheet(&doc, &provisional);
-    let ((pw, ph), [mt, mr, mb, ml]) = page_setup(o, &sheet.pages);
+    let sheet = layout::stylesheet(&doc, &provisional, &o.images);
+    let ((pw, ph), [mt, mr, mb, ml], (first_mt, first_mb)) = page_setup(o, &sheet.pages);
     let (cw, ch) = ((pw - ml - mr).max(1.0), (ph - mt - mb).max(1.0));
     let media = Media { width: cw, height: ch };
-    let sheet = if (cw - provisional.width).abs() < 0.5 && (ch - provisional.height).abs() < 0.5 { sheet } else { layout::stylesheet(&doc, &media) };
+    let sheet = if (cw - provisional.width).abs() < 0.5 && (ch - provisional.height).abs() < 0.5 { sheet } else { layout::stylesheet(&doc, &media, &o.images) };
     let faces = layout::load_font_faces(&sheet.font_faces, &o.images);
 
     let mut tree = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, cw, &mut lcx.borrow_mut()));
     tree.compute(cw);
     let breaks = render::collect_breaks(&tree);
-    let pages = render::paginate(ch, &breaks);
+    let pages = render::paginate((ph - first_mt - first_mb).max(1.0), ch, &breaks);
+    // header / footer: the request's, else the @page margin boxes
+    let bands = |first: bool| {
+        (
+            o.header.clone().or_else(|| margin_band(&sheet.pages, first, "top")),
+            o.footer.clone().or_else(|| margin_band(&sheet.pages, first, "bottom")),
+        )
+    };
+    let (first_bands, bands) = (bands(true), bands(false));
 
     let mut doc = krilla::Document::new();
     let mut meta = krilla::metadata::Metadata::new().creator("pdfrs".into()).producer("pdfrs".into());
@@ -189,6 +249,8 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     let n = pages.len();
     for (i, pg) in pages.iter().enumerate() {
         let (start, end) = (pg.start, pg.end);
+        let (mt, mb) = if i == 0 { (first_mt, first_mb) } else { (mt, mb) };
+        let (header, footer) = if i == 0 { &first_bands } else { &bands };
         let mut page = doc.start_page_with(PageSettings::from_wh(pw, ph).ok_or("invalid page size")?);
         // (x, y, w, h, href) in page coordinates
         let mut links: Vec<(f32, f32, f32, f32, String)> = Vec::new();
@@ -196,10 +258,10 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
             let mut s = page.surface();
             // a table continued from the previous page: its <thead> again on top
             let hh = pg.header_height();
-            if let (Some(h), Some(clip)) = (pg.header, render_clip(pw, mt, hh)) {
+            if let (Some(h), Some(head), Some(clip)) = (pg.header, pg.header.and_then(|h| h.head), render_clip(pw, mt, hh)) {
                 s.push_clip_path(&clip, &krilla::paint::FillRule::NonZero);
-                s.push_transform(&krilla::geom::Transform::from_translate(ml, mt - h.head.0));
-                render::draw(&mut s, &tree, h.table, h.origin.0, h.origin.1, h.head, &mut Vec::new());
+                s.push_transform(&krilla::geom::Transform::from_translate(ml, mt - head.0));
+                render::draw(&mut s, &tree, h.table, h.origin.0, h.origin.1, head, &mut Vec::new());
                 s.pop();
                 s.pop();
             }
@@ -219,8 +281,18 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
                     (y + h > top && y < top + (end - start)).then_some((x, y, w, h, href))
                 }));
             }
+            // a table broken by this page: its <tfoot> again right after the last row
+            let fh = pg.footer_height();
+            let foot_top = top + (end - start);
+            if let (Some(f), Some(foot), Some(clip)) = (pg.footer, pg.footer.and_then(|f| f.foot), render_clip(pw, foot_top, fh)) {
+                s.push_clip_path(&clip, &krilla::paint::FillRule::NonZero);
+                s.push_transform(&krilla::geom::Transform::from_translate(ml, foot_top - foot.0));
+                render::draw(&mut s, &tree, f.table, f.origin.0, f.origin.1, foot, &mut Vec::new());
+                s.pop();
+                s.pop();
+            }
             // header / footer, vertically centered in their margin
-            for (html, top, height) in [(&o.header, 0.0, mt), (&o.footer, ph - mb, mb)] {
+            for (html, top, height) in [(header, 0.0, mt), (footer, ph - mb, mb)] {
                 let Some(html) = html else { continue };
                 let t = band(html, i + 1, n, o, cw, &media, &faces);
                 let th = t.taffy.layout(t.root).map(|l| l.size.height).unwrap_or(0.0);

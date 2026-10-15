@@ -14,6 +14,18 @@ pub struct Decl {
 pub enum Pseudo {
     Before,
     After,
+    Marker,
+    FirstLetter,
+}
+
+/// An `@page` rule: page properties, and its margin boxes (`@top-center { content: ... }`).
+#[derive(Clone, Debug, Default)]
+pub struct PageRule {
+    /// `@page :first`
+    pub first: bool,
+    pub decls: Vec<Decl>,
+    /// (`top-left`, `top-center`, `bottom-right`...) -> declarations
+    pub boxes: Vec<(String, Vec<Decl>)>,
 }
 
 pub struct Rule {
@@ -29,7 +41,7 @@ pub struct Rule {
 #[derive(Default)]
 pub struct Sheet {
     pub rules: Vec<Rule>,
-    pub pages: Vec<Vec<Decl>>,
+    pub pages: Vec<PageRule>,
     pub font_faces: Vec<Vec<Decl>>,
     pub has_pseudo: bool,
 }
@@ -123,8 +135,8 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
             match name.to_ascii_lowercase().as_str() {
                 "media" if depth < 8 && media_matches(args, media) => parse_block(body, media, sheet, depth + 1),
                 "supports" if depth < 8 => parse_block(body, media, sheet, depth + 1),
-                // `@page :first` / `:left` / named pages: only the default page is supported
-                "page" if args.trim().is_empty() => sheet.pages.push(parse_declarations(body)),
+                // the default page and `:first`; `:left` / `:right` / named pages are not supported
+                "page" if matches!(args.trim(), "" | ":first") => sheet.pages.push(parse_page(body, args.trim() == ":first")),
                 "font-face" => sheet.font_faces.push(parse_declarations(body)),
                 _ => {}
             }
@@ -142,6 +154,10 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
                 (&sel[..b.len()], Some(Pseudo::Before))
             } else if let Some(b) = lower.strip_suffix("::after").or(lower.strip_suffix(":after")) {
                 (&sel[..b.len()], Some(Pseudo::After))
+            } else if let Some(b) = lower.strip_suffix("::marker") {
+                (&sel[..b.len()], Some(Pseudo::Marker))
+            } else if let Some(b) = lower.strip_suffix("::first-letter").or(lower.strip_suffix(":first-letter")) {
+                (&sel[..b.len()], Some(Pseudo::FirstLetter))
             } else if lower.contains("::") {
                 continue; // ::marker, ::first-line, ::placeholder...: not generated
             } else {
@@ -158,6 +174,24 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
             }
         }
     }
+}
+
+/// `@page` body: declarations, and nested margin boxes `@top-center { ... }`
+fn parse_page(body: &str, first: bool) -> PageRule {
+    let mut rule = PageRule { first, ..PageRule::default() };
+    let mut decls = String::new();
+    let mut rest = body;
+    while let Some(at) = rest.find('@') {
+        decls.push_str(&rest[..at]);
+        let Some(open) = rest[at..].find('{').map(|o| at + o) else { break };
+        let Some(close) = rest[open..].find('}').map(|c| open + c) else { break };
+        let name = rest[at + 1..open].trim().to_ascii_lowercase();
+        rule.boxes.push((name, parse_declarations(&rest[open + 1..close])));
+        rest = &rest[close + 1..];
+    }
+    decls.push_str(rest);
+    rule.decls = parse_declarations(&decls);
+    rule
 }
 
 /// `print`, `screen and (min-width: 600px)`, `(orientation: landscape)`, `not print`, lists with commas.
@@ -325,13 +359,21 @@ mod tests {
             &A4,
             &mut s,
         );
-        assert_eq!(s.rules.len(), 5); // p (print), h1, .a, p::before, li::after
+        assert_eq!(s.rules.len(), 6); // p (print), h1, .a, p::before, li::after, *::marker
+        assert_eq!(s.rules[5].pseudo, Some(Pseudo::Marker));
         assert_eq!(s.rules[1].specificity, (0, 0, 1));
         assert_eq!(s.rules[2].specificity, (0, 1, 0));
         assert_eq!(s.rules[3].pseudo, Some(Pseudo::Before));
         assert_eq!(s.rules[4].pseudo, Some(Pseudo::After));
         assert!(s.has_pseudo);
-        assert_eq!((s.pages.len(), s.font_faces.len()), (1, 1));
+        assert_eq!((s.pages.len(), s.font_faces.len()), (2, 1));
+        assert!(!s.pages[0].first && s.pages[1].first);
+        let mut s = Sheet::default();
+        parse_stylesheet("@page { margin: 1cm; @top-center { content: 'T'; color: red } @bottom-right { content: counter(page) } size: A5 } li::marker { color: red } p::first-letter { font-size: 2em }", &A4, &mut s);
+        let page = &s.pages[0];
+        assert_eq!(page.decls.iter().map(|d| d.prop.as_str()).collect::<Vec<_>>(), ["margin", "size"]);
+        assert_eq!(page.boxes.iter().map(|b| b.0.as_str()).collect::<Vec<_>>(), ["top-center", "bottom-right"]);
+        assert_eq!(s.rules.iter().map(|r| r.pseudo).collect::<Vec<_>>(), [Some(Pseudo::Marker), Some(Pseudo::FirstLetter)]);
     }
 
     #[test]

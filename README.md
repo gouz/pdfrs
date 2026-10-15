@@ -58,7 +58,7 @@ As query parameters or JSON fields:
 |---|---|---|
 | `PORT` | `3000` | |
 | `WORKERS` | number of cores | render threads; extra requests wait their turn |
-| `FONTS_DIR` | `/fonts` | font directories (`.ttf`, `.otf`, `.ttc`, recursive), separated by `:` |
+| `FONTS_DIR` | `/fonts` | font directories (`.ttf`, `.otf`, `.ttc`, `.woff`, `.woff2`, recursive), separated by `:` |
 | `IMAGES_DIR` | — | directory for local images, see [Images](#images) |
 | `MAX_BODY_MB` | `20` | maximum request size |
 
@@ -80,7 +80,7 @@ The image ships **Liberation Sans / Serif / Mono**, metric-compatible with Helve
 
 - `Helvetica`, `Arial`, `sans-serif`, `system-ui` → Liberation Sans; `Times-Roman`, `serif` → Liberation Serif; `Courier`, `monospace` → Liberation Mono.
 - As in a browser, a stack like `font-family: "Segoe UI", Roboto, sans-serif` uses the first available font. If none is available, the declaration is ignored and the parent's font applies.
-- A document can bring its own fonts with `@font-face` (`font-family`, `src`, `font-weight`, `font-style`): `src: url(data:font/ttf;base64,…)`, or a file of `IMAGES_DIR` (`src: url(fonts/Inter.ttf)`). TrueType / OpenType only, not WOFF / WOFF2. They are visible to that document only (and its header / footer).
+- A document can bring its own fonts with `@font-face` (`font-family`, `src`, `font-weight`, `font-style`): `src: url(data:font/woff2;base64,…)`, or a file of `IMAGES_DIR` (`src: url(fonts/Inter.woff2)`). TrueType, OpenType, WOFF and WOFF2. They are visible to that document only (and its header / footer).
 - To add fonts for every document, mount them into the container: `docker run -v ./fonts:/fonts/extra pdfrs` (all of `FONTS_DIR` is scanned). They are usable by family name, in CSS as well as in the `font` option. Bold and italic use the family's matching files when they exist.
 - No CJK font in the image: add for example Noto Sans CJK to `FONTS_DIR` for Chinese, Japanese or Korean.
 
@@ -111,26 +111,27 @@ As in pdfjs, **1 px = 1 pt**.
 - Full **flexbox**: `flex-direction`, `flex-wrap`, `flex` / `flex-grow` / `flex-shrink` / `flex-basis`, `justify-content`, `align-items`, `align-self`, `align-content`, `gap`, `order`.
 - **Grid**: `grid-template-columns` / `-rows` (`fr`, `repeat()`, `minmax()`, `auto`…), `grid-column` / `grid-row`, `grid-auto-flow`, `gap`, `justify-items`, `place-items`…
 - **Boxes**: `width` / `height` (+ `min-` / `max-`), `box-sizing`, `margin`, `padding`, `border` (width, `solid` / `dashed` / `dotted`, color per side), `border-radius`, `background-color`, `opacity`, `overflow: hidden`, `aspect-ratio`.
-- **Backgrounds**: `background-image: url()` (same policy as `<img>`: `data:` or `IMAGES_DIR`) with `background-size` (`cover`, `contain`, lengths, `%`), `background-position` (keywords, lengths, `%`, `right 10px bottom 5px`), `background-repeat` (`repeat`, `no-repeat`, `repeat-x` / `-y`), all in the `background` shorthand too; colors and gradients, `linear-gradient()` (angles, `to right`, `to top left`…), `radial-gradient()` (`circle` / `ellipse`, `at` position), `repeating-` variants, color stops with positions; in `background` or `background-image` (first gradient layer).
-- **Shadows**: `box-shadow` with offsets, blur, spread, color and several shadows; a blurred shadow is drawn as a bitmap under the box (~2 px per pt), an unblurred one as a crisp vector shape. `inset` shadows are ignored.
+- **Backgrounds**: colors, gradients and `url()` images (same policy as `<img>`: `data:` or `IMAGES_DIR`), **several layers** (first on top), with `background-size` (`cover`, `contain`, lengths, `%`), `background-position` (keywords, lengths, `%`, `right 10px bottom 5px`), `background-repeat` (`repeat`, `no-repeat`, `repeat-x` / `-y`), `background-origin` and `background-clip` (`border-box`, `padding-box`, `content-box`); all in the `background` shorthand too, lists cycled per layer as in CSS. Gradients tile like images (`background-size` makes stripes).
+- **Shadows**: `box-shadow` with offsets, blur, spread, color, `inset`, several shadows; a blurred shadow is drawn as a bitmap (~2 px per pt), an unblurred one as a crisp vector shape.
 - **Transforms**: `transform` (`translate`, `scale`, `rotate`, `skew`, `matrix`, their `X` / `Y` forms, combined) and `transform-origin`. As in CSS, the layout is unchanged; links in a transformed box keep their untransformed area.
-- **Generated content**: `::before` / `::after` (and `:before` / `:after`) with `content` strings, escapes (`"\201C"`), `attr()`, `open-quote` / `close-quote`, any style; `display: block` makes a box. `<q>` gets quotes.
+- **Generated content**: `::before` / `::after` (and `:before` / `:after`) with `content` strings, escapes (`"\201C"`), `attr()`, `open-quote` / `close-quote`, `counter()` / `counters()`, any style; `display: block` makes a box. `<q>` gets quotes. `::marker` styles list markers and can replace them (`content: "✓ "`); `::first-letter` styles the first letter of a block (inline: not floated).
+- **Counters**: `counter-reset`, `counter-increment`, `counter-set`, scoped as in CSS (a reset is visible to the following siblings), the implicit `list-item` counter of lists (`<ol start>`, `<li value>`), any list style (`counter(chapter, upper-roman)`); table rows and cells count too.
 - **Values**: custom properties `--name` and `var(--name, fallback)` (inherited, nestable), `calc()` (`+ - * /`, parentheses, any mix of units, `calc(100% - 20px)` included), `min()` / `max()` / `clamp()` on absolute lengths.
-- **At-rules**: `@media` (`print` / `all` match, `screen` does not; `min-` / `max-width` / `-height`, range syntax `(width >= 600px)`, `orientation`, `not`, lists; evaluated against the page area), `<style media="…">`, `@supports` (assumed true), `@page` (size and margins), `@font-face`.
+- **At-rules**: `@media` (`print` / `all` match, `screen` does not; `min-` / `max-width` / `-height`, range syntax `(width >= 600px)`, `orientation`, `not`, lists; evaluated against the page area), `<style media="…">`, `<link rel="stylesheet">` (files of `IMAGES_DIR` only, never the network), `@supports` (assumed true), `@page` (size and margins) and `@page :first` (its top / bottom margins), page-margin boxes (`@top-left` / `-center` / `-right`, `@bottom-…`: `content` with strings and `counter(page)` / `counter(pages)`, any text style; the `header` / `footer` options win over them), `@font-face`.
 - **Right-to-left**: `dir="rtl"` / `direction: rtl` (bidi text, alignment, flex and grid order, list markers on the right). Hebrew and Arabic are shaped with DejaVu Sans.
 - **Inline boxes**: `inline-block` (and `inline-flex` / `-grid` / `-table`) and images sit in the line of text like in a browser: padding, borders and backgrounds are kept, the box shrinks to fit the line when it is too wide, and `vertical-align` (`baseline`, `middle`, `top`, `bottom`, `text-top`, `text-bottom`) places it; `text-align` centers an image. Direct children of a flex or grid box are items instead, as in CSS.
-- **Text**: `vertical-align: sub` / `super` (`<sub>`, `<sup>`), `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
+- **Text**: `vertical-align` (`sub`, `super`, lengths, `%` of the line height) for text and inline boxes, `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
 - **Units**: `px`, `pt`, `em`, `rem`, `%`, `mm`, `cm`, `in`, `pc`. Colors: names, `#hex`, `rgb()`, `hsl()`…
-- **Pagination**: automatic page breaks between lines of text (never through a line, an image or a table cell that fits on a page), `page-break-before` / `-after: always` (or `break-before: page`), `page-break-inside: avoid`. A table that continues on the next page repeats its `<thead>` at the top.
+- **Pagination**: automatic page breaks between lines of text (never through a line, an image or a table cell that fits on a page), `page-break-before` / `-after: always` (or `break-before: page`), `page-break-inside: avoid`. A table that continues on the next page repeats its `<thead>` at the top, and its `<tfoot>` at the bottom of each page it breaks on.
 - **HTML**: tables (grid with `colspan` / `rowspan`, `border-collapse`, `border-spacing`, `vertical-align`), lists (`disc`, `circle`, `square`, `decimal`, `lower-alpha`, `upper-roman`…, `<ol start>`, `<li value>`), clickable links (`http(s):`, `mailto:`, `tel:`), `<br>`, `<pre>`, `<svg>`, browser default styles (`h1`…`h6`, `b`, `i`, `code`…), `align` / `bgcolor` attributes.
 - `<style>` with all CSS selectors (`>`, `+`, `~`, `:first-child`, `:nth-child()`, `[attr]`, `:not()`…), specificity and `!important`.
 
-**Not supported**: `inset` box shadows, several `background-image` layers (the first `url()` and the first gradient are drawn), `background-attachment`, `background-origin` / `-clip` (images are positioned in the padding box and clipped to the border box), repeating `<tfoot>`, `counter()` / `counter-increment` (empty in `content`), `::marker` / `::first-line` / `::first-letter`, `@page :first` / named pages / page-margin boxes (use the `header` / `footer` options), WOFF / WOFF2 fonts, external `<link>` stylesheets, text wrapping around a `float`, `vertical-align` with a length or a percentage.
+**Not supported**: `::first-line`, `::first-letter` as a floated drop cap, `@page :left` / `:right` / named pages, side and corner margin boxes (`@left-top`, `@top-left-corner`…), a first page with its own size or side margins (only its top / bottom margins), `background-attachment`, `background-clip: text`, external stylesheets over the network, `@import`, text wrapping around a `float`.
 
 **Differences from pdfjs**:
 - Vertical margins collapse like in a browser (react-pdf adds them up): paragraphs are slightly tighter.
 - No infinite loop or crash on a `min-height` taller than the page, `gap: normal`, `border: medium` or an unknown font: nothing to work around.
-- Much more CSS: grid, gradients, transforms, `::before` / `::after`, `var()`, `calc()`, `@media`, `@page`, `@font-face`, right-to-left text.
+- Much more CSS: grid, gradients, transforms, shadows, `::before` / `::after` / `::marker`, counters, `var()`, `calc()`, `@media`, `@page` with margin boxes, `@font-face` (WOFF2 too), `<link>` stylesheets, right-to-left text, repeated table headers and footers.
 - No remote images.
 
 ## Examples
@@ -143,6 +144,7 @@ As in pdfjs, **1 px = 1 pt**.
 | [`demo/report.html`](demo/report.html) | [`demo/report.pdf`](demo/report.pdf) | 3 pages: grid, lists, SVG, `<pre>`, long table with a repeated header, forced page break (rendered with a header and a footer) |
 | [`demo/inline.html`](demo/inline.html) | [`demo/inline.pdf`](demo/inline.pdf) | badges, buttons, cards and images in the line of text, shrink-to-fit, `vertical-align`, `<sub>` / `<sup>` |
 | [`demo/backgrounds.html`](demo/backgrounds.html) | [`demo/backgrounds.pdf`](demo/backgrounds.pdf) | `box-shadow`, `background-image` (tiles, `cover`, `contain`, position), a 3-page table repeating its `<thead>` |
+| [`demo/print.html`](demo/print.html) + [`print.css`](demo/print.css) | [`demo/print.pdf`](demo/print.pdf) | `<link>` stylesheet, `@page` A5 with margin boxes (`Page 1 sur 4`) and a different first page, counters (`I.`, `1.1`, `counters()`), `::marker`, `::first-letter`, 3 background layers, `inset` shadow, repeated `<thead>` and `<tfoot>` |
 | [`demo/features.html`](demo/features.html) | [`demo/features.pdf`](demo/features.pdf) | gradients, transforms, `calc()`, `var()`, `::before` / `::after`, `@media`, `@page`, right-to-left |
 
 ## Performance

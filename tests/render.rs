@@ -250,3 +250,173 @@ fn shadows_and_background_images_render() {
     assert!(pages(&out) >= 5);
     assert!(t.elapsed().as_secs_f32() < 10.0, "too slow: {:?}", t.elapsed());
 }
+
+#[test]
+fn counters_markers_and_first_letter() {
+    if !has_pdftotext() {
+        return;
+    }
+    let html = r#"<style>
+        body { counter-reset: ch }
+        h2 { counter-increment: ch } h2::before { content: counter(ch, upper-roman) ". " }
+        ol.n { list-style: none; counter-reset: item } ol.n li { counter-increment: item }
+        ol.n li::before { content: counters(item, ".") ") " }
+        ul li::marker { content: "-> " }
+        p::first-letter { color: red; font-size: 2em }
+        tr { counter-increment: row } td.num::before { content: counter(row) }
+      </style>
+      <h2>Alpha</h2><h2>Beta</h2>
+      <ol class="n"><li>a<ol class="n"><li>b</li><li>c</li></ol></li><li>d</li></ol>
+      <ol start="5"><li>five</li><li>six</li></ol><ul><li>dash</li></ul>
+      <p>Lettrine intacte</p>
+      <table><tr><td class="num"></td><td>x</td></tr><tr><td class="num"></td><td>y</td></tr></table>"#;
+    let text = text_of(&pdf(html, &Options::default()));
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for want in ["I. Alpha", "II. Beta", "1) a", "1.1) b", "1.2) c", "2) d", "5. five", "6. six", "-> dash", "Lettrine intacte"] {
+        assert!(flat.contains(want), "{want:?} not in {flat:?}");
+    }
+    // row counters (narrow cells: pdftotext glues the columns)
+    assert!(flat.replace(' ', "").contains("1x2y"), "{flat:?}");
+}
+
+#[test]
+fn page_margin_boxes_and_first_page() {
+    if !has_pdftotext() {
+        return;
+    }
+    let body = "<p>ligne</p>".repeat(150);
+    let html = format!(
+        r#"<style>
+        @page {{ margin: 50px 40px; @top-right {{ content: "Entete" }} @bottom-center {{ content: "Page " counter(page) " / " counter(pages) }} }}
+        @page :first {{ margin-top: 120px; @top-right {{ content: none }} }}
+      </style>{body}"#
+    );
+    let out = pdf(&html, &Options::default());
+    let n = pages(&out);
+    assert!(n >= 2);
+    let text = text_of(&out);
+    let per_page: Vec<&str> = text.split('\x0c').filter(|p| !p.trim().is_empty()).collect();
+    assert_eq!(per_page.len(), n);
+    for (i, p) in per_page.iter().enumerate() {
+        assert!(p.contains(&format!("Page {} / {n}", i + 1)), "page {}: {p}", i + 1);
+        assert_eq!(p.contains("Entete"), i > 0, "header on page {}", i + 1);
+    }
+    // the request's footer wins over the margin boxes
+    let out = pdf(&html, &Options { footer: Some("<p>pied</p>".into()), ..Options::default() });
+    assert!(!text_of(&out).contains("Page 1 /"));
+}
+
+#[test]
+fn tfoot_repeats_where_the_table_breaks() {
+    if !has_pdftotext() {
+        return;
+    }
+    let rows: String = (0..120).map(|i| format!("<tr><td>r{i}</td></tr>")).collect();
+    let html = format!("<table><thead><tr><th>Entete</th></tr></thead><tfoot><tr><td>Pied</td></tr></tfoot><tbody>{rows}</tbody></table>");
+    let out = pdf(&html, &Options::default());
+    let n = pages(&out);
+    assert!(n >= 3);
+    let text = text_of(&out);
+    assert_eq!(text.matches("Pied").count(), n, "one footer per page");
+    assert_eq!(text.matches("Entete").count(), n, "one header per page");
+}
+
+#[test]
+fn link_stylesheet_comes_from_the_image_directory_only() {
+    if !has_pdftotext() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("pdfrs-link-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("site")).unwrap();
+    std::fs::write(root.join("site/style.css"), "p::after { content: ' [styled]' }").unwrap();
+    std::fs::write(root.join("secret.css"), "p::after { content: ' [secret]' }").unwrap();
+    let images = pdfrs::ImagePolicy { base_dir: Some(root.join("site")) };
+    let o = Options { images, ..Options::default() };
+    let text = text_of(&pdf(r#"<link rel="stylesheet" href="style.css"><link rel="stylesheet" href="../secret.css"><p>x</p>"#, &o));
+    assert!(text.contains("[styled]") && !text.contains("[secret]"), "{text}");
+    // no image directory: nothing loads
+    let text = text_of(&pdf(r#"<link rel="stylesheet" href="style.css"><p>x</p>"#, &Options::default()));
+    assert!(!text.contains("[styled]"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A minimal WOFF 1.0 encoder (zlib per table), to test decoding without a font tool.
+fn to_woff1(sfnt: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let u16_at = |o: usize| u16::from_be_bytes([sfnt[o], sfnt[o + 1]]);
+    let u32_at = |o: usize| u32::from_be_bytes([sfnt[o], sfnt[o + 1], sfnt[o + 2], sfnt[o + 3]]);
+    let n = u16_at(4) as usize;
+    let mut tables = Vec::new();
+    for i in 0..n {
+        let e = 12 + 16 * i;
+        let (tag, checksum, offset, len) = (u32_at(e), u32_at(e + 4), u32_at(e + 8) as usize, u32_at(e + 12) as usize);
+        let raw = &sfnt[offset..offset + len];
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(raw).unwrap();
+        let comp = z.finish().unwrap();
+        tables.push((tag, checksum, if comp.len() < len { comp } else { raw.to_vec() }, len));
+    }
+    let mut out = vec![0u8; 44 + 20 * n];
+    let mut offset = out.len();
+    let mut dir = Vec::new();
+    for (tag, checksum, data, orig) in &tables {
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        offset = out.len();
+        out.extend_from_slice(data);
+        dir.push((*tag, offset as u32, data.len() as u32, *orig as u32, *checksum));
+    }
+    let _ = offset;
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    let total_sfnt: u32 = 12 + 16 * n as u32 + tables.iter().map(|t| (t.3 as u32 + 3) & !3).sum::<u32>();
+    let len = out.len() as u32;
+    let mut h = Vec::new();
+    h.extend_from_slice(b"wOFF");
+    h.extend_from_slice(&u32_at(0).to_be_bytes());
+    h.extend_from_slice(&len.to_be_bytes());
+    h.extend_from_slice(&(n as u16).to_be_bytes());
+    h.extend_from_slice(&0u16.to_be_bytes());
+    h.extend_from_slice(&total_sfnt.to_be_bytes());
+    h.extend_from_slice(&[0, 1, 0, 0]); // version 1.0
+    h.extend_from_slice(&[0u8; 20]); // no metadata, no private data
+    for (tag, off, comp, orig, checksum) in dir {
+        for v in [tag, off, comp, orig, checksum] {
+            h.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+    out[..h.len()].copy_from_slice(&h);
+    out
+}
+
+#[test]
+fn woff_font_face() {
+    use base64::Engine;
+    let dir = std::env::var("FONTS_DIR").unwrap_or("/usr/share/fonts".into());
+    let Some(ttf) = ["liberation/LiberationSerif-Regular.ttf", "truetype/liberation/LiberationSerif-Regular.ttf"]
+        .iter()
+        .find_map(|f| std::fs::read(std::path::Path::new(&dir).join(f)).ok())
+    else {
+        return;
+    };
+    let woff = to_woff1(&ttf);
+    assert_eq!(&woff[..4], b"wOFF");
+    assert!(pdfrs::fonts::to_sfnt(woff.clone()).is_some(), "WOFF decodes");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&woff);
+    let html = format!("<style>@font-face {{ font-family: W; src: url(data:font/woff;base64,{b64}) format('woff') }} p {{ font-family: W }}</style><p>x</p>");
+    assert!(String::from_utf8_lossy(&pdf(&html, &Options::default())).contains("LiberationSerif"));
+}
+
+#[test]
+fn lot4_decorations_do_not_panic() {
+    let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let html = format!(
+        r#"<div style="background: url({png}) 0 0 / 5px repeat content-box, linear-gradient(red, blue) padding-box, url({png}) center / 50% auto no-repeat, #eee; background-clip: content-box, border-box; padding: 10px; border: 4px dotted; height: 50px"></div>
+           <div style="box-shadow: inset 0 0 10px 3px rgba(0,0,0,.5), inset 3px 3px 0 red, 0 2px 4px #000; border-radius: 20px; height: 40px; border: 2px solid"></div>
+           <div style="box-shadow: inset 0 0 0 1000px red; width: 10px; height: 10px"></div>
+           <p>a <span style="vertical-align: -3px">b</span> <span style="vertical-align: 50%">c</span> <img src="{png}" width="5" style="vertical-align: 2em"></p>"#
+    );
+    pdf(&html, &Options::default());
+}
