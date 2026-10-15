@@ -59,7 +59,11 @@ As query parameters or JSON fields:
 | `PORT` | `3000` | |
 | `WORKERS` | number of cores | render threads; extra requests wait their turn |
 | `FONTS_DIR` | `/fonts` | font directories (`.ttf`, `.otf`, `.ttc`, `.woff`, `.woff2`, recursive), separated by `:` |
-| `IMAGES_DIR` | — | directory for local images, see [Images](#images) |
+| `IMAGES_DIR` | — | directory for local images, stylesheets and fonts, see [Images](#images) |
+| `REMOTE_RESOURCES` | off | `1`: also load http(s) images, stylesheets and fonts, see [Remote resources](#remote-resources) |
+| `REMOTE_HOSTS` | any public host | comma separated allow-list: `cdn.example.com,*.example.org` |
+| `REMOTE_TIMEOUT_MS` / `REMOTE_MAX_MB` | `5000` / `10` | per download |
+| `REMOTE_ALLOW_PRIVATE` | off | `1`: allow loopback and private addresses (a trusted internal network only) |
 | `MAX_BODY_MB` | `20` | maximum request size |
 
 ## Command line
@@ -72,7 +76,7 @@ cargo run --release -- invoice.html invoice.pdf --size A5 --footer '<p>{page} / 
 docker run --rm -v "$PWD":/w -w /w --entrypoint /pdfrs pdfrs invoice.html invoice.pdf
 ```
 
-Options: `--size`, `--landscape`, `--margin`, `--font`, `--font-size`, `--header`, `--footer`, `--title`. Local images are allowed from the HTML file's folder.
+Options: `--size`, `--landscape`, `--margin`, `--font`, `--font-size`, `--header`, `--footer`, `--title`, `--remote`. Local images, stylesheets and fonts are allowed from the HTML file's folder.
 
 ## Fonts
 
@@ -92,7 +96,7 @@ The HTML may come from an untrusted source, so **by default only `data:` images 
 |---|---|
 | `data:image/...` | always |
 | `logo.png`, `img/a.jpg` | `IMAGES_DIR` is set and the file is **inside** that directory (`../`, absolute paths and symlinks pointing outside are refused) |
-| `https://...` | never: rendering makes no network requests (inline the image as `data:`) |
+| `https://...` | remote resources are enabled (`REMOTE_RESOURCES=1`, `--remote`), see below |
 | `file://`, others | never |
 
 ```bash
@@ -103,21 +107,32 @@ A refused or missing image is not displayed and a warning is written to stderr.
 
 Formats: PNG, JPEG, GIF, WebP and SVG (in `<img>` or inline `<svg>…</svg>` in the HTML). Images are inline, as in a browser: they sit in the line of text (`vertical-align` applies, `text-align: center` centers them); `display: block`, a float or being a flex / grid item takes them out of the line. An image without a size keeps its natural size (1 px = 1 pt), without exceeding the available width; `width` / `height` (attributes or CSS) are honored, keeping the aspect ratio when only one is given. `object-fit` and `border-radius` are supported.
 
+### Remote resources
+
+Off by default: the HTML may be untrusted, and fetching a URL it names is the server making a request on its author's behalf (SSRF: cloud metadata endpoints, internal services). With `REMOTE_RESOURCES=1` (or `--remote`), `http(s)` images, background images, `<link>` / `@import` stylesheets and `@font-face` fonts are downloaded, with these guards:
+
+- `http` and `https` only;
+- addresses resolving to loopback, private, link-local, unique-local, carrier-grade NAT or multicast networks are refused, checked on every connection: redirects (3 at most, each checked) and DNS rebinding cannot get around it;
+- optional host allow-list (`REMOTE_HOSTS`), timeout and size limit per download;
+- each URL is downloaded once per document, the `<img>` of a document 8 at a time.
+
+A refused or failed download is reported on stderr and rendered as a missing image / stylesheet / font.
+
 ## Supported CSS
 
 As in pdfjs, **1 px = 1 pt**.
 
-- **Layout**: `display` `block` / `inline` / `inline-block` / `flex` / `inline-flex` / `grid` / `inline-grid` / `none` / `contents` / `list-item` / `table…`, margins that collapse like in a browser, `float` / `clear`, `position: absolute` (relative to the parent).
+- **Layout**: `display` `block` / `inline` / `inline-block` / `flex` / `inline-flex` / `grid` / `inline-grid` / `none` / `contents` / `list-item` / `table…`, margins that collapse like in a browser, `float` / `clear` with **text wrapping around floats** (images, boxes, drop caps: lines beside a float are shortened, then take the full width below it; a line with no room beside it goes below), `position: absolute` (relative to the parent).
 - Full **flexbox**: `flex-direction`, `flex-wrap`, `flex` / `flex-grow` / `flex-shrink` / `flex-basis`, `justify-content`, `align-items`, `align-self`, `align-content`, `gap`, `order`.
 - **Grid**: `grid-template-columns` / `-rows` (`fr`, `repeat()`, `minmax()`, `auto`…), `grid-column` / `grid-row`, `grid-auto-flow`, `gap`, `justify-items`, `place-items`…
 - **Boxes**: `width` / `height` (+ `min-` / `max-`), `box-sizing`, `margin`, `padding`, `border` (width, `solid` / `dashed` / `dotted`, color per side), `border-radius`, `background-color`, `opacity`, `overflow: hidden`, `aspect-ratio`.
-- **Backgrounds**: colors, gradients and `url()` images (same policy as `<img>`: `data:` or `IMAGES_DIR`), **several layers** (first on top), with `background-size` (`cover`, `contain`, lengths, `%`), `background-position` (keywords, lengths, `%`, `right 10px bottom 5px`), `background-repeat` (`repeat`, `no-repeat`, `repeat-x` / `-y`), `background-origin` and `background-clip` (`border-box`, `padding-box`, `content-box`); all in the `background` shorthand too, lists cycled per layer as in CSS. Gradients tile like images (`background-size` makes stripes).
+- **Backgrounds**: colors, gradients and `url()` images, **several layers** (first on top), with `background-size` (`cover`, `contain`, lengths, `%`), `background-position` (keywords, lengths, `%`, `right 10px bottom 5px`), `background-repeat`, `background-origin` and `background-clip` (`border-box`, `padding-box`, `content-box`, and `text`: gradient text, with `-webkit-text-fill-color`), `background-attachment: fixed` (against the page, on every page); all in the `background` shorthand too. The `html` / `body` background covers the whole page, margins included, like a browser's canvas.
 - **Shadows**: `box-shadow` with offsets, blur, spread, color, `inset`, several shadows; a blurred shadow is drawn as a bitmap (~2 px per pt), an unblurred one as a crisp vector shape.
 - **Transforms**: `transform` (`translate`, `scale`, `rotate`, `skew`, `matrix`, their `X` / `Y` forms, combined) and `transform-origin`. As in CSS, the layout is unchanged; links in a transformed box keep their untransformed area.
-- **Generated content**: `::before` / `::after` (and `:before` / `:after`) with `content` strings, escapes (`"\201C"`), `attr()`, `open-quote` / `close-quote`, `counter()` / `counters()`, any style; `display: block` makes a box. `<q>` gets quotes. `::marker` styles list markers and can replace them (`content: "✓ "`); `::first-letter` styles the first letter of a block (inline: not floated).
+- **Generated content**: `::before` / `::after` (and `:before` / `:after`) with `content` strings, escapes (`"\201C"`), `attr()`, `open-quote` / `close-quote`, `counter()` / `counters()`, any style; `display: block` makes a box. `<q>` gets quotes. `::marker` styles list markers and can replace them (`content: "✓ "`); `::first-letter` styles the first letter of a block (floated: a drop cap the text wraps around); `::first-line` styles the first line as laid out (its text is shaped again until the styled line fits).
 - **Counters**: `counter-reset`, `counter-increment`, `counter-set`, scoped as in CSS (a reset is visible to the following siblings), the implicit `list-item` counter of lists (`<ol start>`, `<li value>`), any list style (`counter(chapter, upper-roman)`); table rows and cells count too.
 - **Values**: custom properties `--name` and `var(--name, fallback)` (inherited, nestable), `calc()` (`+ - * /`, parentheses, any mix of units, `calc(100% - 20px)` included), `min()` / `max()` / `clamp()` on absolute lengths.
-- **At-rules**: `@media` (`print` / `all` match, `screen` does not; `min-` / `max-width` / `-height`, range syntax `(width >= 600px)`, `orientation`, `not`, lists; evaluated against the page area), `<style media="…">`, `<link rel="stylesheet">` (files of `IMAGES_DIR` only, never the network), `@supports` (assumed true), `@page` (size and margins) and `@page :first` (its top / bottom margins), page-margin boxes (`@top-left` / `-center` / `-right`, `@bottom-…`: `content` with strings and `counter(page)` / `counter(pages)`, any text style; the `header` / `footer` options win over them), `@font-face`.
+- **At-rules**: `@media` (`print` / `all` match, `screen` does not; `min-` / `max-width` / `-height`, range syntax `(width >= 600px)`, `orientation`, `not`, lists; evaluated against the page area), `<style media="…">`, `<link rel="stylesheet">` and `@import` (files of `IMAGES_DIR`, or remote resources; `url()` relative to the stylesheet), `@supports` (assumed true), `@font-face`, and `@page`: size, margins, `:first` / `:left` / `:right` (mirrored margins move the column, its width stays), named pages (`@page wide { size: A4 landscape }` + `page: wide` on a top-level element: a section laid out at its own width, numbering and counters carry on), every margin box (`@top-left` / `-center` / `-right`, `@bottom-…`, corners `@top-left-corner`…, sides `@left-top` / `-middle` / `-bottom`, `@right-…`) with `content`, `counter(page)` / `counter(pages)` and any text style; the `header` / `footer` options win over the top / bottom boxes.
 - **Right-to-left**: `dir="rtl"` / `direction: rtl` (bidi text, alignment, flex and grid order, list markers on the right). Hebrew and Arabic are shaped with DejaVu Sans.
 - **Inline boxes**: `inline-block` (and `inline-flex` / `-grid` / `-table`) and images sit in the line of text like in a browser: padding, borders and backgrounds are kept, the box shrinks to fit the line when it is too wide, and `vertical-align` (`baseline`, `middle`, `top`, `bottom`, `text-top`, `text-bottom`) places it; `text-align` centers an image. Direct children of a flex or grid box are items instead, as in CSS.
 - **Text**: `vertical-align` (`sub`, `super`, lengths, `%` of the line height) for text and inline boxes, `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
@@ -126,13 +141,13 @@ As in pdfjs, **1 px = 1 pt**.
 - **HTML**: tables (grid with `colspan` / `rowspan`, `border-collapse`, `border-spacing`, `vertical-align`), lists (`disc`, `circle`, `square`, `decimal`, `lower-alpha`, `upper-roman`…, `<ol start>`, `<li value>`), clickable links (`http(s):`, `mailto:`, `tel:`), `<br>`, `<pre>`, `<svg>`, browser default styles (`h1`…`h6`, `b`, `i`, `code`…), `align` / `bgcolor` attributes.
 - `<style>` with all CSS selectors (`>`, `+`, `~`, `:first-child`, `:nth-child()`, `[attr]`, `:not()`…), specificity and `!important`.
 
-**Not supported**: `::first-line`, `::first-letter` as a floated drop cap, `@page :left` / `:right` / named pages, side and corner margin boxes (`@left-top`, `@top-left-corner`…), a first page with its own size or side margins (only its top / bottom margins), `background-attachment`, `background-clip: text`, external stylesheets over the network, `@import`, text wrapping around a `float`.
+**Not supported**: a first page wider or narrower than the others (the text would have to change width mid-paragraph; a named page covers a different cover page), floats that do not precede text in the same block (a float followed by blocks narrows them, the text does not flow back under it), `clear` on text after a float, `background-clip: text` with images (gradients only), `@page` named pages for nested elements (top-level ones only).
 
 **Differences from pdfjs**:
 - Vertical margins collapse like in a browser (react-pdf adds them up): paragraphs are slightly tighter.
 - No infinite loop or crash on a `min-height` taller than the page, `gap: normal`, `border: medium` or an unknown font: nothing to work around.
 - Much more CSS: grid, gradients, transforms, shadows, `::before` / `::after` / `::marker`, counters, `var()`, `calc()`, `@media`, `@page` with margin boxes, `@font-face` (WOFF2 too), `<link>` stylesheets, right-to-left text, repeated table headers and footers.
-- No remote images.
+- Remote images, stylesheets and fonts only when enabled, with SSRF guards.
 
 ## Examples
 
@@ -144,6 +159,7 @@ As in pdfjs, **1 px = 1 pt**.
 | [`demo/report.html`](demo/report.html) | [`demo/report.pdf`](demo/report.pdf) | 3 pages: grid, lists, SVG, `<pre>`, long table with a repeated header, forced page break (rendered with a header and a footer) |
 | [`demo/inline.html`](demo/inline.html) | [`demo/inline.pdf`](demo/inline.pdf) | badges, buttons, cards and images in the line of text, shrink-to-fit, `vertical-align`, `<sub>` / `<sup>` |
 | [`demo/backgrounds.html`](demo/backgrounds.html) | [`demo/backgrounds.pdf`](demo/backgrounds.pdf) | `box-shadow`, `background-image` (tiles, `cover`, `contain`, position), a 3-page table repeating its `<thead>` |
+| [`demo/floats.html`](demo/floats.html) | [`demo/floats.pdf`](demo/floats.pdf) | text wrapping around a floated image and box, a floated drop cap, justified text |
 | [`demo/print.html`](demo/print.html) + [`print.css`](demo/print.css) | [`demo/print.pdf`](demo/print.pdf) | `<link>` stylesheet, `@page` A5 with margin boxes (`Page 1 sur 4`) and a different first page, counters (`I.`, `1.1`, `counters()`), `::marker`, `::first-letter`, 3 background layers, `inset` shadow, repeated `<thead>` and `<tfoot>` |
 | [`demo/features.html`](demo/features.html) | [`demo/features.pdf`](demo/features.pdf) | gradients, transforms, `calc()`, `var()`, `::before` / `::after`, `@media`, `@page`, right-to-left |
 
@@ -189,7 +205,7 @@ docker exec pdfrs-dev cargo test
 docker exec pdfrs-dev cargo run --release -- demo/report.html report.pdf
 ```
 
-With Rust installed, `cargo test` and `cargo run` work the same way, with `FONTS_DIR` pointing to a font directory.
+With Rust installed, `cargo test` and `cargo run` work the same way, with `FONTS_DIR` pointing to a font directory. `cargo run --release --example bench` times the benchmark documents without HTTP (µs per document).
 
 | File | |
 |---|---|

@@ -59,6 +59,11 @@ fn empty_document_has_one_page() {
 
 #[test]
 fn hostile_input_does_not_panic() {
+    // on a thread like the server's render threads (16 MB of stack)
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(hostile_inputs).unwrap().join().unwrap();
+}
+
+fn hostile_inputs() {
     let o = Options::default();
     for html in [
         "<div style='width:-10px;height:1e30px;margin:-1e9px'>x</div>",
@@ -569,4 +574,22 @@ fn named_pages_make_sections() {
     assert!(per_page[0].contains("1. Avant") && per_page[0].contains("1/3"));
     assert!(per_page[1].contains("PAYSAGE") && per_page[1].contains("2. Large") && per_page[1].contains("2/3"));
     assert!(per_page[2].contains("3. Apres") && per_page[2].contains("3/3") && !per_page[2].contains("PAYSAGE"));
+}
+
+#[test]
+fn text_wraps_around_floats() {
+    if !has_pdftotext() {
+        return;
+    }
+    let text: String = (0..120).map(|i| format!("w{i} ")).collect();
+    let html = format!(r#"<p><span style="float:left;width:100px;height:60px;background:#ccc"></span>{text}</p><p style="float:right">x</p>"#);
+    let w = words(&pdf(&html, &Options::default()));
+    let line_x = |word: &str| w.iter().find(|x| x.0 == word).map(|x| (x.1, x.2)).unwrap();
+    let (first_x, first_y) = line_x("w0");
+    let (last_x, last_y) = line_x("w119");
+    assert!((first_x - 140.0).abs() < 1.0, "beside the float: {first_x}");
+    assert!(last_y > first_y + 60.0 && (last_x - 40.0).abs() < 200.0, "below the float: {last_x}, {last_y}");
+    // the first word of a line below the float starts at the content edge again
+    let lefts: Vec<f32> = w.iter().filter(|x| x.0.starts_with('w') && x.2 > first_y + 62.0).map(|x| x.1).collect();
+    assert!(lefts.iter().any(|x| (x - 40.0).abs() < 1.0), "{lefts:?}");
 }

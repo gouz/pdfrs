@@ -235,7 +235,13 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     // local images: only from the input file's folder
     let base = std::fs::canonicalize(&input).ok().and_then(|p| p.parent().map(PathBuf::from));
     let opts = options(p, ImagePolicy { base_dir: base, remote: remote.then(|| Arc::new(pdfrs::remote::RemoteConfig::from_env())) })?;
-    let pdf = html_to_pdf(&html, &opts)?;
+    // same stack as the server's render threads
+    let pdf = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || html_to_pdf(&html, &opts))
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "render panicked".to_string())??;
     std::fs::write(&output, pdf).map_err(|e| format!("{output}: {e}"))?;
     println!("✔ {output}");
     Ok(())

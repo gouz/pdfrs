@@ -95,6 +95,9 @@ fn walk_breaks(tree: &Tree, n: NodeId, ox: f32, oy: f32, b: &mut Breaks) {
     match tree.taffy.get_node_context(n) {
         Some(Leaf::Text(t)) => {
             let top = y + l.padding.top + l.border.top;
+            for f in &t.floats {
+                b.atoms.push((top + f.pos.1, top + f.pos.1 + f.size.1));
+            }
             for line in t.layout.lines() {
                 let m = line.metrics();
                 b.atoms.push((top + m.block_min_coord, top + m.block_max_coord));
@@ -911,7 +914,14 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
     }
     let (cx, cy) = (x + l.padding.left + l.border.left, y + l.padding.top + l.border.top);
     match tree.taffy.get_node_context(n) {
-        Some(Leaf::Text(t)) => draw_text(s, tree, n, t, cx, cy, window, links),
+        Some(Leaf::Text(t)) => {
+            for f in &t.floats {
+                if let Ok(fl) = tree.taffy.layout(f.node) {
+                    draw(s, tree, f.node, cx + f.pos.0 + fl.margin.left - fl.location.x, cy + f.pos.1 + fl.margin.top - fl.location.y, window, links);
+                }
+            }
+            draw_text(s, tree, n, t, cx, cy, window, links)
+        }
         Some(Leaf::Image(img)) if y < window.1 && y + h > window.0 => {
             draw_image(s, img, cx, cy, l.content_box_width(), l.content_box_height());
         }

@@ -83,8 +83,18 @@ pub struct TextLeaf {
     pub layout: parley::Layout<Brush>,
     pub text: String,
     pub align: parley::Alignment,
+    /// floats the lines wrap around (laid out on their own, placed at the top of the block)
+    pub floats: Vec<FloatBox>,
     /// `::first-line` of the block: the pieces and container to rebuild the text from, the declarations
     first_line: Option<FirstLine>,
+}
+
+/// A float in a block of text: its box (a detached subtree), side, margin-box size and position.
+pub struct FloatBox {
+    pub node: NodeId,
+    pub left: bool,
+    pub size: (f32, f32),
+    pub pos: (f32, f32),
 }
 
 struct FirstLine {
@@ -197,6 +207,8 @@ pub struct Tree {
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
     /// (inline box root, text leaf holding it), inner boxes first
     inline: Vec<(NodeId, NodeId)>,
+    /// (float root, text leaf wrapping around it)
+    floats: Vec<(NodeId, NodeId)>,
     /// table -> its <thead> cells, repeated at the top of the pages the table continues on
     pub headers: HashMap<NodeId, Vec<NodeId>>,
     /// table -> its <tfoot> cells, repeated at the bottom of the pages the table breaks on
@@ -215,6 +227,8 @@ enum Piece {
     Break(Rc<Style>, Brush),
     /// an inline-block or an inline image: a box laid out on its own, placed in the line
     Box(NodeId, Rc<Style>),
+    /// a floated box the text of the block wraps around
+    Float(NodeId, bool),
 }
 
 #[derive(Default)]
@@ -241,6 +255,7 @@ struct Builder<'a> {
     walk_depth: usize,
     calc: Vec<(NodeId, Vec<(CalcField, f32, f32)>)>,
     inline: Vec<(NodeId, NodeId)>,
+    floats: Vec<(NodeId, NodeId)>,
     headers: HashMap<NodeId, Vec<NodeId>>,
     footers: HashMap<NodeId, Vec<NodeId>>,
     cells: std::collections::HashSet<NodeId>,
@@ -466,6 +481,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             walk_depth: 0,
             calc: Vec::new(),
             inline: Vec::new(),
+            floats: Vec::new(),
             headers: HashMap::new(),
             footers: HashMap::new(),
             cells: Default::default(),
@@ -491,7 +507,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.bg = body_style.bg.clone().or(html_style.bg.clone());
         b.apply_counters(body, &body_style, &mut Vec::new());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, footers: b.footers, cells: b.cells, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect(), top_pages: b.top_pages }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, floats: b.floats, headers: b.headers, footers: b.footers, cells: b.cells, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect(), top_pages: b.top_pages }
     })
 }
 
@@ -591,6 +607,7 @@ fn text_layout(fcx: &mut FontContext, lcx: &mut LayoutContext<Brush>, pieces: &[
                 b.pop_style_span();
                 b.pop_style_span();
             }
+            Piece::Float(..) => {}
             Piece::Box(node, s) => {
                 // sized before layout (Tree::size_inline_boxes)
                 b.push_inline_box(parley::InlineBox {
@@ -897,7 +914,9 @@ impl Builder<'_> {
         let decls = css::matched(el, Some(Pseudo::FirstLetter), &UA, &self.sheet.rules, &[]);
         if !decls.is_empty() {
             let mut fl = Style::compute(s, &decls, self.rem);
-            fl.display = Display::Inline;
+            if fl.float == taffy::Float::None {
+                fl.display = Display::Inline;
+            }
             self.first_letter = Some(Rc::new(fl));
             owns.0 = true;
         }
@@ -1064,6 +1083,11 @@ impl Builder<'_> {
                     // children of a flex / grid box are its items, whatever their display (blockified)
                     let item = Some(parent.id()) == ctx.owner && matches!(container.display, Display::Flex | Display::Grid);
                     let in_flow = !cs.position_absolute && cs.float == taffy::Float::None;
+                    // a float in a block of text: laid out on its own, the text of the block wraps around it
+                    if !item && cs.float != taffy::Float::None && !cs.position_absolute && self.box_depth < MAX_BOX_DEPTH {
+                        self.float_piece(el, cs, ctx);
+                        continue;
+                    }
                     match el.value().name() {
                         "br" => {
                             ctx.group.push(Piece::Break(cs, brush.clone()));
@@ -1131,6 +1155,18 @@ impl Builder<'_> {
         self.end_counter_scope(scope);
     }
 
+    /// A floated element as a box of its own, for the text of the block to wrap around.
+    #[inline(never)]
+    fn float_piece(&mut self, el: ElementRef, cs: Rc<Style>, ctx: &mut Ctx) {
+        let left = cs.float == taffy::Float::Left;
+        self.box_depth += 1;
+        let node = if matches!(el.value().name(), "img" | "svg") { self.replaced(el, &cs) } else { self.build_box(el, cs) };
+        self.box_depth -= 1;
+        if let Some(n) = node {
+            ctx.group.push(Piece::Float(n, left));
+        }
+    }
+
     /// A text node into the group; the first letter split off when a ::first-letter waits for it.
     #[inline(never)]
     fn text(&mut self, t: &str, s: &Rc<Style>, brush: &Brush, ctx: &mut Ctx) {
@@ -1158,7 +1194,20 @@ impl Builder<'_> {
             ctx.group.push(Piece::Text(text[..start].to_string(), s.clone(), brush.clone()));
         }
         let b = Brush { color: fl.color, background: fl.background.or(brush.background), ..brush.clone() };
-        ctx.group.push(Piece::Text(text[start..end].to_string(), fl, b));
+        if fl.float != taffy::Float::None {
+            // a drop cap: the letter in its own floated box
+            let pending = self.first_line.take();
+            let leaf = self.text_leaf(vec![Piece::Text(text[start..end].to_string(), fl.clone(), b)], &fl);
+            self.first_line = pending;
+            let mut st = to_taffy(&fl);
+            st.display = taffy::Display::Block;
+            if let Some(node) = leaf.and_then(|l| self.taffy.new_with_children(st, &[l]).ok()) {
+                self.finish_node(node, &fl);
+                ctx.group.push(Piece::Float(node, fl.float == taffy::Float::Left));
+            }
+        } else {
+            ctx.group.push(Piece::Text(text[start..end].to_string(), fl, b));
+        }
         ctx.group.push(Piece::Text(text[end..].to_string(), s.clone(), brush.clone()));
     }
 
@@ -1226,7 +1275,7 @@ impl Builder<'_> {
     fn text_leaf(&mut self, group: Vec<Piece>, container: &Rc<Style>) -> Option<NodeId> {
         let visible = group.iter().any(|p| match p {
             Piece::Text(t, s, _) => matches!(s.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine) && !t.is_empty() || !t.trim().is_empty(),
-            Piece::Break(..) | Piece::Box(..) => true,
+            Piece::Break(..) | Piece::Box(..) | Piece::Float(..) => true,
         });
         if !visible {
             return None;
@@ -1240,10 +1289,17 @@ impl Builder<'_> {
             TextAlign::Justify => parley::Alignment::Justify,
         };
         let first_line = self.first_line.take().map(|decls| FirstLine { pieces: group.clone(), container: container.clone(), decls, rem: self.rem });
-        let leaf = self.taffy.new_leaf_with_context(taffy::Style::default(), Leaf::Text(TextLeaf { layout, text, align, first_line })).ok()?;
+        let floats = group.iter().filter_map(|p| match p {
+            Piece::Float(node, left) => Some(FloatBox { node: *node, left: *left, size: (0.0, 0.0), pos: (0.0, 0.0) }),
+            _ => None,
+        });
+        let floats = floats.collect();
+        let leaf = self.taffy.new_leaf_with_context(taffy::Style::default(), Leaf::Text(TextLeaf { layout, text, align, floats, first_line })).ok()?;
         for p in &group {
-            if let Piece::Box(node, _) = p {
-                self.inline.push((*node, leaf));
+            match p {
+                Piece::Box(node, _) => self.inline.push((*node, leaf)),
+                Piece::Float(node, _) => self.floats.push((*node, leaf)),
+                _ => {}
             }
         }
         Some(leaf)
@@ -1456,6 +1512,73 @@ fn side_mut<T>(r: &mut taffy::Rect<T>, i: usize) -> &mut T {
     }
 }
 
+/// Break a leaf's lines at `max` width (None: max-content), around its floats if it has any.
+/// Returns the (width, height) it takes, floats included.
+pub fn wrap(t: &mut TextLeaf, max: Option<f32>) -> (f32, f32) {
+    if t.floats.is_empty() {
+        t.layout.break_all_lines(max);
+        return (t.layout.width(), t.layout.height());
+    }
+    let floats_w: f32 = t.floats.iter().map(|f| f.size.0).sum();
+    let Some(width) = max else {
+        // max-content: the text on one line beside every float
+        t.layout.break_all_lines(None);
+        let mut x = 0.0;
+        for f in t.floats.iter_mut() {
+            f.pos = (x, 0.0);
+            x += f.size.0;
+        }
+        let h = t.floats.iter().map(|f| f.size.1).fold(t.layout.height(), f32::max);
+        return (t.layout.width() + floats_w, h);
+    };
+    // floats side by side at the top: left ones from the left edge, right ones from the right edge
+    let (mut lx, mut rx) = (0.0f32, width);
+    for f in t.floats.iter_mut() {
+        if f.left {
+            f.pos = (lx, 0.0);
+            lx += f.size.0;
+        } else {
+            rx -= f.size.0;
+            f.pos = (rx, 0.0);
+        }
+    }
+    let rects: Vec<(f32, f32, f32, f32, bool)> = t.floats.iter().map(|f| (f.pos.0, f.pos.1, f.size.0, f.size.1, f.left)).collect();
+    // room for a line between y and y + h: (x, width), and the bottom of the floats it overlaps
+    let room = |y: f32, h: f32| {
+        let (mut l, mut r, mut bottom) = (0.0f32, width, f32::INFINITY);
+        for &(fx, fy, fw, fh, left) in &rects {
+            if fy < y + h && fy + fh > y {
+                if left { l = l.max(fx + fw) } else { r = r.min(fx) }
+                bottom = bottom.min(fy + fh);
+            }
+        }
+        (l, (r - l).max(0.0), bottom)
+    };
+    let mut br = t.layout.break_lines();
+    br.state_mut().set_layout_max_advance(width);
+    let mut line_h = 16.0f32;
+    for _ in 0..100_000 {
+        let y = br.state().line_y() as f32;
+        let (x, w, bottom) = room(y, line_h);
+        br.state_mut().set_line_x(x);
+        br.state_mut().set_line_max_advance(w.min(width));
+        match br.break_next() {
+            Some(parley::YieldData::LineBreak(d)) => {
+                line_h = (d.line_y_end - d.line_y_start) as f32;
+                // nothing fits beside the floats: retry the line below them
+                if d.metrics.advance > w + 0.5 && bottom.is_finite() && w < width && br.revert() {
+                    br.state_mut().set_line_y(bottom as f64);
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    br.finish();
+    let h = rects.iter().map(|r| r.1 + r.3).fold(t.layout.height(), f32::max);
+    (width, h)
+}
+
 /// Measure a leaf: text wraps at the available width, images keep their aspect ratio.
 pub fn measure(inputs: taffy::LayoutInput, leaf: Option<&mut Leaf>, style: &taffy::Style) -> taffy::LayoutOutput {
     taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| match leaf {
@@ -1465,8 +1588,8 @@ pub fn measure(inputs: taffy::LayoutInput, leaf: Option<&mut Leaf>, style: &taff
                 AvailableSpace::MinContent => Some(0.0),
                 AvailableSpace::MaxContent => None,
             });
-            t.layout.break_all_lines(max);
-            Size { width: known.width.unwrap_or_else(|| t.layout.width()), height: known.height.unwrap_or_else(|| t.layout.height()) }
+            let (w, h) = wrap(t, max);
+            Size { width: known.width.unwrap_or(w), height: known.height.unwrap_or(h) }
         }
         Some(Leaf::Image(img)) => {
             let (nw, nh) = img.natural;
@@ -1615,6 +1738,7 @@ impl Tree {
         let mut out = Vec::new();
         let mut stack = vec![root];
         stack.extend(self.inline.iter().map(|i| i.0));
+        stack.extend(self.floats.iter().map(|f| f.0));
         while let Some(n) = stack.pop() {
             let children = self.taffy.children(n).unwrap_or_default();
             if children.is_empty() {
@@ -1653,7 +1777,7 @@ impl Tree {
             stack.extend(self.taffy.children(n).unwrap_or_default());
             let w = self.taffy.layout(n).map(|l| l.content_box_width()).unwrap_or(0.0);
             if let Some(Leaf::Text(t)) = self.taffy.get_node_context_mut(n) {
-                t.layout.break_all_lines(Some(w + 0.01));
+                wrap(t, Some(w + 0.01));
                 t.layout.align(t.align, parley::AlignmentOptions::default());
             }
         }
@@ -1687,11 +1811,39 @@ impl Tree {
         for (bx, leaf) in self.inline.clone() {
             self.lay_out_inline_box(bx, leaf, None);
         }
+        for (f, leaf) in self.floats.clone() {
+            self.lay_out_float(f, leaf, None);
+        }
+    }
+
+    /// Lay a float out on its own (max-content, or `width`) and record its margin-box size in its leaf.
+    fn lay_out_float(&mut self, f: NodeId, leaf: NodeId, width: Option<f32>) -> f32 {
+        let space = Size { width: width.map_or(AvailableSpace::MaxContent, AvailableSpace::Definite), height: AvailableSpace::MaxContent };
+        let _ = self.taffy.compute_layout_with_measure(f, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+        self.finish_text(f);
+        let Ok(l) = self.taffy.layout(f).cloned() else { return 0.0 };
+        let size = (l.size.width + l.margin.left + l.margin.right, l.size.height + l.margin.top + l.margin.bottom);
+        if let Some(Leaf::Text(t)) = self.taffy.get_node_context_mut(leaf) {
+            for fb in t.floats.iter_mut().filter(|fb| fb.node == f) {
+                fb.size = size;
+            }
+        }
+        let _ = self.taffy.mark_dirty(leaf);
+        size.0
     }
 
     /// Inline boxes wider than their line, laid out again at the line's width; true if any shrank.
     fn fit_inline_boxes(&mut self) -> bool {
         let mut changed = false;
+        // floats wider than their block: laid out again at its width
+        for (f, leaf) in self.floats.clone() {
+            let avail = self.taffy.layout(leaf).map(|l| l.content_box_width()).unwrap_or(0.0);
+            let Ok(l) = self.taffy.layout(f).cloned() else { continue };
+            let current = l.size.width + l.margin.left + l.margin.right;
+            if current > avail + 0.5 && self.lay_out_float(f, leaf, Some((avail - l.margin.left - l.margin.right).max(0.0))) < current - 0.5 {
+                changed = true;
+            }
+        }
         for (bx, leaf) in self.inline.clone() {
             let avail = self.taffy.layout(leaf).map(|l| l.content_box_width()).unwrap_or(0.0);
             let Ok(l) = self.taffy.layout(bx).cloned() else { continue };
