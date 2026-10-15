@@ -1,6 +1,6 @@
 //! Image policy and loading. HTML may be untrusted, so by default only inline data: images load:
 //!   - local files only if `base_dir` is set, and only inside it (no ../, absolute path or symlink escape)
-//!   - http(s) never (this build does not fetch: rendering never makes network requests)
+//!   - http(s) only when remote resources are enabled (see remote.rs for the guards)
 //!   - any other scheme (file:, ftp:, ...) never
 
 use base64::Engine;
@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default)]
 pub struct ImagePolicy {
     pub base_dir: Option<PathBuf>,
+    /// http(s) resources: None = refused
+    pub remote: Option<std::sync::Arc<crate::remote::RemoteConfig>>,
 }
 
 pub enum Source {
@@ -29,7 +31,10 @@ pub fn resolve(src: &str, policy: &ImagePolicy) -> Option<Source> {
             Some(Source::Data(percent_decode(data).into_bytes()))
         };
     }
-    // any scheme (http:, file:, ...) is refused
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return crate::remote::cached(src, policy.remote.as_deref()?).map(Source::Data);
+    }
+    // any other scheme (file:, ftp:, ...) is refused
     if lower.split_once(':').is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))) {
         return None;
     }
@@ -81,7 +86,7 @@ mod tests {
         std::fs::write(site.join("logo.png"), b"x").unwrap();
         std::fs::write(root.join("secret.png"), b"x").unwrap();
         let _ = std::os::unix::fs::symlink(root.join("secret.png"), site.join("link.png"));
-        let p = ImagePolicy { base_dir: Some(site.clone()) };
+        let p = ImagePolicy { base_dir: Some(site.clone()), remote: None };
         let none = ImagePolicy::default();
         let ok = |s: &str, p: &ImagePolicy| resolve(s, p).is_some();
 

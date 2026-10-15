@@ -247,19 +247,135 @@ pub fn stylesheet(doc: &Html, media: &Media, policy: &ImagePolicy) -> Sheet {
             continue;
         }
         if s.value().name() == "style" {
-            css::parse_stylesheet(&s.text().collect::<String>(), media, &mut sheet);
+            css::parse_stylesheet(&with_imports(&s.text().collect::<String>(), None, policy, 0), media, &mut sheet);
         } else if s.value().attr("rel").is_some_and(|r| r.split_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet"))) {
             let href = s.value().attr("href").unwrap_or("");
-            match images::resolve(href, policy) {
-                Some(images::Source::File(f)) => match std::fs::read(&f) {
-                    Ok(css) => css::parse_stylesheet(&String::from_utf8_lossy(&css), media, &mut sheet),
-                    Err(e) => eprintln!("pdfrs: stylesheet {href:?}: {e}"),
-                },
-                _ => eprintln!("pdfrs: stylesheet blocked or not found: {}", href.chars().take(80).collect::<String>()),
+            if let Some(css) = load_css(href, policy) {
+                css::parse_stylesheet(&with_imports(&css, Some(href), policy, 0), media, &mut sheet);
             }
         }
     }
     sheet
+}
+
+/// A stylesheet file: from the image directory, or http(s) when remote resources are enabled.
+fn load_css(href: &str, policy: &ImagePolicy) -> Option<String> {
+    let data = match images::resolve(href, policy) {
+        Some(images::Source::File(f)) => std::fs::read(&f).ok(),
+        Some(images::Source::Data(d)) => Some(d),
+        None => None,
+    };
+    if data.is_none() {
+        eprintln!("pdfrs: stylesheet blocked or not found: {}", href.chars().take(80).collect::<String>());
+    }
+    // url() in the sheet are relative to the sheet, not to the document
+    data.map(|d| absolute_urls(&String::from_utf8_lossy(&d), href))
+}
+
+/// `rel` relative to `base` (a URL or a path in the image directory)
+fn join_url(base: &str, rel: &str) -> String {
+    let lower = rel.to_ascii_lowercase();
+    if lower.contains("://") || lower.starts_with("data:") || lower.starts_with('#') {
+        return rel.to_string();
+    }
+    if let Some(path) = rel.strip_prefix('/') {
+        return match base.split_once("://") {
+            Some((scheme, rest)) => format!("{scheme}://{}/{path}", rest.split('/').next().unwrap_or("")),
+            None => path.to_string(),
+        };
+    }
+    let dir = base.split(['?', '#']).next().unwrap_or("");
+    // the directory of the base: up to its last '/' (keeping `scheme://host`)
+    let cut = dir.rfind('/').filter(|i| !dir[..*i].ends_with('/') && !dir[..*i].ends_with(':'));
+    match cut {
+        Some(i) => format!("{}/{rel}", &dir[..i]),
+        None if dir.contains("://") => format!("{dir}/{rel}"),
+        None => rel.to_string(),
+    }
+}
+
+/// Rewrite the relative `url(...)` of a stylesheet against the stylesheet's own location.
+fn absolute_urls(css: &str, base: &str) -> String {
+    if !base.contains('/') {
+        return css.to_string();
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(i) = rest.find("url(") {
+        out.push_str(&rest[..i + 4]);
+        rest = &rest[i + 4..];
+        let close = rest.find(')').unwrap_or(rest.len());
+        let inner = rest[..close].trim();
+        let q = inner.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let target = q.map_or(inner, |q| inner.trim_matches(q));
+        out.push_str(&format!("\"{}\"", join_url(base, target)));
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Inline the `@import url(x) [media];` statements of a stylesheet (recursively, 4 levels at most).
+fn with_imports(css: &str, base: Option<&str>, policy: &ImagePolicy, depth: usize) -> String {
+    if !css.contains("@import") || depth >= 4 {
+        return css.to_string();
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(at) = rest.find("@import") {
+        out.push_str(&rest[..at]);
+        let Some(end) = rest[at..].find(';').map(|e| at + e) else {
+            rest = "";
+            break;
+        };
+        let stmt = rest[at + "@import".len()..end].trim();
+        rest = &rest[end + 1..];
+        // `url("x") media`, `"x" media`
+        let (target, media) = if let Some(u) = stmt.strip_prefix("url(") {
+            let close = u.find(')').unwrap_or(u.len());
+            (&u[..close], u.get(close + 1..).unwrap_or(""))
+        } else {
+            let q = stmt.chars().next().unwrap_or('"');
+            let inner = &stmt[1.min(stmt.len())..];
+            let close = inner.find(q).unwrap_or(inner.len());
+            (&inner[..close], inner.get(close + 1..).unwrap_or(""))
+        };
+        let target = target.trim().trim_matches(|c| c == '"' || c == '\'');
+        let target = base.map_or(target.to_string(), |b| join_url(b, target));
+        if let Some(imported) = load_css(&target, policy) {
+            let imported = with_imports(&imported, Some(&target), policy, depth + 1);
+            if media.trim().is_empty() {
+                out.push_str(&imported);
+            } else {
+                out.push_str(&format!("@media {} {{ {imported} }}", media.trim()));
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls_relative_to_their_stylesheet() {
+        assert_eq!(join_url("https://cdn.test/css/a.css", "b.css"), "https://cdn.test/css/b.css");
+        assert_eq!(join_url("https://cdn.test/css/a.css", "../img/x.png"), "https://cdn.test/css/../img/x.png");
+        assert_eq!(join_url("https://cdn.test/css/a.css", "/root.css"), "https://cdn.test/root.css");
+        assert_eq!(join_url("https://cdn.test", "b.css"), "https://cdn.test/b.css");
+        assert_eq!(join_url("css/site.css", "../img/x.png"), "css/../img/x.png");
+        assert_eq!(join_url("site.css", "img.png"), "img.png");
+        assert_eq!(join_url("css/site.css", "data:image/png;base64,AA"), "data:image/png;base64,AA");
+        assert_eq!(absolute_urls("a { background: url('i.png') } @font-face { src: url(f.woff2) }", "s/x.css"), "a { background: url(\"s/i.png\") } @font-face { src: url(\"s/f.woff2\") }");
+    }
+}
+
+/// The http(s) `<img>` sources of a document, to download in parallel before laying it out.
+pub fn remote_images(doc: &Html) -> Vec<String> {
+    let sel = scraper::Selector::parse("img[src]").unwrap();
+    doc.select(&sel).filter_map(|i| i.value().attr("src")).filter(|s| s.starts_with("http://") || s.starts_with("https://")).map(String::from).collect()
 }
 
 /// Load the @font-face fonts a sheet declares: `data:` URLs, or files of the image directory.

@@ -175,7 +175,11 @@ async fn serve() {
         .and_then(|w| w.parse().ok())
         .filter(|w| *w > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    let images = ImagePolicy { base_dir: std::env::var("IMAGES_DIR").ok().filter(|d| !d.is_empty()).map(PathBuf::from) };
+    let remote = std::env::var("REMOTE_RESOURCES").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    let images = ImagePolicy {
+        base_dir: std::env::var("IMAGES_DIR").ok().filter(|d| !d.is_empty()).map(PathBuf::from),
+        remote: remote.then(|| Arc::new(pdfrs::remote::RemoteConfig::from_env())),
+    };
     let max_body = std::env::var("MAX_BODY_MB").ok().and_then(|m| m.parse::<usize>().ok()).unwrap_or(20) * 1024 * 1024;
     let state = Arc::new(AppState { jobs: Mutex::new(spawn_workers(workers)), images });
     let app = Router::new()
@@ -192,7 +196,7 @@ async fn serve() {
             std::process::exit(1);
         }
     };
-    eprintln!("pdfrs listening on :{port} ({workers} render threads, {n} font files)");
+    eprintln!("pdfrs listening on :{port} ({workers} render threads, {n} font files, remote resources {})", if remote { "on" } else { "off" });
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
@@ -205,6 +209,7 @@ async fn serve() {
 fn cli(args: Vec<String>) -> Result<(), String> {
     let mut p = Params::default();
     let mut pos = Vec::new();
+    let mut remote = false;
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or(format!("{a}: missing value"));
@@ -217,6 +222,7 @@ fn cli(args: Vec<String>) -> Result<(), String> {
             "--header" => p.header = Some(val()?),
             "--footer" => p.footer = Some(val()?),
             "--title" => p.title = Some(val()?),
+            "--remote" => remote = true,
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => pos.push(a),
@@ -228,7 +234,7 @@ fn cli(args: Vec<String>) -> Result<(), String> {
     fonts_init();
     // local images: only from the input file's folder
     let base = std::fs::canonicalize(&input).ok().and_then(|p| p.parent().map(PathBuf::from));
-    let opts = options(p, ImagePolicy { base_dir: base })?;
+    let opts = options(p, ImagePolicy { base_dir: base, remote: remote.then(|| Arc::new(pdfrs::remote::RemoteConfig::from_env())) })?;
     let pdf = html_to_pdf(&html, &opts)?;
     std::fs::write(&output, pdf).map_err(|e| format!("{output}: {e}"))?;
     println!("✔ {output}");
@@ -244,11 +250,12 @@ fn main() {
             eprintln!("pdfrs: {e}");
         }
         eprintln!(
-            "Usage: pdfrs                                   HTTP server (PORT, WORKERS, FONTS_DIR, IMAGES_DIR)
+            "Usage: pdfrs                                   HTTP server (PORT, WORKERS, FONTS_DIR, IMAGES_DIR, REMOTE_RESOURCES)
        pdfrs <input.html> [output.pdf] [options]
   --size A4|LETTER|400x600   --landscape   --margin 40 | '60 40 50 40'
   --font Georgia             --font-size 12
-  --header '<p>Titre</p>'    --footer '<p>{{page}} / {{pages}}</p>'   --title 'Facture 42'"
+  --header '<p>Titre</p>'    --footer '<p>{{page}} / {{pages}}</p>'   --title 'Facture 42'
+  --remote                   also load http(s) images, stylesheets and fonts (REMOTE_HOSTS, REMOTE_ALLOW_PRIVATE...)"
         );
         std::process::exit(1);
     }

@@ -7,6 +7,7 @@ pub mod css;
 pub mod fonts;
 pub mod images;
 pub mod layout;
+pub mod remote;
 pub mod render;
 pub mod style;
 
@@ -200,6 +201,7 @@ struct DocGuard;
 impl Drop for DocGuard {
     fn drop(&mut self) {
         render::end_document();
+        remote::end_document();
     }
 }
 
@@ -207,6 +209,9 @@ impl Drop for DocGuard {
 pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     let _guard = DocGuard;
     let doc = Html::parse_document(html);
+    if let Some(remote) = &o.images.remote {
+        remote::prefetch(layout::remote_images(&doc), remote);
+    }
     // @page first (it can sit in @media print), then the sheets for the real page area
     let provisional = Media { width: 515.28, height: 761.89 };
     let sheet = layout::stylesheet(&doc, &provisional, &o.images);

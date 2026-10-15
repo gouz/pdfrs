@@ -330,7 +330,7 @@ fn link_stylesheet_comes_from_the_image_directory_only() {
     std::fs::create_dir_all(root.join("site")).unwrap();
     std::fs::write(root.join("site/style.css"), "p::after { content: ' [styled]' }").unwrap();
     std::fs::write(root.join("secret.css"), "p::after { content: ' [secret]' }").unwrap();
-    let images = pdfrs::ImagePolicy { base_dir: Some(root.join("site")) };
+    let images = pdfrs::ImagePolicy { base_dir: Some(root.join("site")), remote: None };
     let o = Options { images, ..Options::default() };
     let text = text_of(&pdf(r#"<link rel="stylesheet" href="style.css"><link rel="stylesheet" href="../secret.css"><p>x</p>"#, &o));
     assert!(text.contains("[styled]") && !text.contains("[secret]"), "{text}");
@@ -419,4 +419,62 @@ fn lot4_decorations_do_not_panic() {
            <p>a <span style="vertical-align: -3px">b</span> <span style="vertical-align: 50%">c</span> <img src="{png}" width="5" style="vertical-align: 2em"></p>"#
     );
     pdf(&html, &Options::default());
+}
+
+/// A tiny HTTP server on 127.0.0.1: path -> (status, extra header, body). Returns its base URL.
+fn serve(routes: Vec<(&'static str, u16, &'static str, Vec<u8>)>) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+            }
+            let (status, header, body) = routes.iter().find(|r| r.0 == path).map(|r| (r.1, r.2, r.3.clone())).unwrap_or((404, "", Vec::new()));
+            let mut s = stream;
+            let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n{header}\r\n", body.len());
+            let _ = s.write_all(&body);
+        }
+    });
+    base
+}
+
+#[test]
+fn remote_resources_when_enabled() {
+    if !has_pdftotext() {
+        return;
+    }
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        .unwrap();
+    let base = serve(vec![
+        ("/a.png", 200, "", png.clone()),
+        ("/moved.png", 302, "Location: /a.png\r\n", Vec::new()),
+        ("/style.css", 200, "", b"@import url(more.css); p::after { content: ' [remote css]' }".to_vec()),
+        ("/more.css", 200, "", b"p::before { content: '[imported] ' }".to_vec()),
+    ]);
+    let html = format!(r#"<link rel="stylesheet" href="{base}/style.css"><p>x</p><img src="{base}/a.png" width="20"><img src="{base}/moved.png" width="20"><img src="{base}/missing.png">"#);
+    let allow = |allow_private| pdfrs::ImagePolicy {
+        base_dir: None,
+        remote: Some(std::sync::Arc::new(pdfrs::remote::RemoteConfig { allow_private, ..Default::default() })),
+    };
+    let out = pdf(&html, &Options { images: allow(true), ..Options::default() });
+    let text = text_of(&out);
+    assert!(text.contains("[imported] x [remote css]"), "{text}");
+    assert!(String::from_utf8_lossy(&out).matches("/Subtype/Image").count() >= 1, "images embedded");
+    // default guards: 127.0.0.1 is private, refused
+    let text = text_of(&pdf(&html, &Options { images: allow(false), ..Options::default() }));
+    assert!(!text.contains("[remote css]"));
+    // remote resources off: refused too
+    let text = text_of(&pdf(&html, &Options::default()));
+    assert!(!text.contains("[remote css]"));
 }

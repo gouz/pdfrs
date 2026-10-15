@@ -22,6 +22,7 @@ taffy = { version = "0.15.0", features = ["parse"] }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
 usvg = "0.47"
 wuff = "0.2.9"
+ureq = "3.4.2"
 
 [profile.release]
 lto = "fat"
