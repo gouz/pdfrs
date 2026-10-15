@@ -1,6 +1,6 @@
 # pdfrs
 
-Generates PDFs from HTML/CSS, **without a browser**: a Rust port of [`@gouz/pdfjs`](https://github.com/gouz/pdfjs), shipped as a small HTTP API in a ~20 MB Docker image, **~4.5× faster per core and ~7× leaner in memory** (see [Performance](#performance)).
+Generates PDFs from HTML/CSS, **without a browser**: a Rust port of [`@gouz/pdfjs`](https://github.com/gouz/pdfjs), shipped as a small HTTP API in a ~24 MB Docker image, **~4.7× faster per core and ~7× leaner in memory** (see [Performance](#performance)).
 
 - HTML parsing by [html5ever](https://github.com/servo/html5ever) (Servo's parser), CSS selectors by [`selectors`](https://crates.io/crates/selectors)
 - Layout by [Taffy](https://github.com/DioxusLabs/taffy): block (with margin collapsing), flexbox, **grid**, float — the counterpart of Yoga in react-pdf
@@ -165,25 +165,26 @@ As in pdfjs, **1 px = 1 pt**.
 
 ## Performance
 
-Measured with [k6](https://k6.io), same scenario as pdfjs (`bench/k6.js`: POST the three documents in `demo/` in turn, PDF response). **Everything runs in Docker on the same VM** (12 CPUs, k6 included) for a like-for-like comparison: pdfrs in its image, pdfjs 1.1.0 with `bench/server.ts` on `node:26-alpine` (`NODE_ENV=production`, `--max-old-space-size=128`). Each stage lasts 15 s; memory is the server container's peak (`docker stats`, rounded to the nearest GB above 1 GB).
+Measured with [k6](https://k6.io), same scenario as pdfjs (`bench/k6.js`: POST the three documents in `demo/` in turn, PDF response). **Everything runs in Docker on the same VM** (12 CPUs, k6 included) for a like-for-like comparison: pdfrs 0.3.0 in its image, pdfjs 1.1.0 with `bench/server.ts` on `node:26-alpine` (`NODE_ENV=production`, `--max-old-space-size=128`). Each stage lasts 15 s; memory is the server container's peak (`docker stats`, rounded to the nearest GB above 1 GB). The five configurations are measured in the same run: compare them with each other, not with another run (the machine's speed varies from one run to the next, by 15 to 25 % for both servers).
 
-![Throughput by number of concurrent users: pdfrs climbs to ~6,900 PDF/s, pdfjs tops out at ~1,900 PDF/s with 12 Node processes and ~330 PDF/s with one](bench/chart.svg)
+![Throughput by number of concurrent users: pdfrs climbs to ~6,000 PDF/s, pdfjs tops out at ~1,400 PDF/s with 12 Node processes and ~280 PDF/s with one](bench/chart.svg)
 
-![Peak memory: ~140 MB for pdfrs on 12 cores, ~25 MB on one core, ~210 MB for Node × 1, ~2 GB for Node × 12](bench/memory.svg)
+![Peak memory: ~150 MB for pdfrs on 12 cores, ~25 MB on one core, ~210 MB for Node × 1, ~2 GB for Node × 12](bench/memory.svg)
 
 | Server | Max throughput | p95 at 10 VUs | p95 at 200 VUs | Memory at 200 VUs | Errors |
 |---|---|---|---|---|---|
-| **pdfrs, 12 threads** | **6,912 PDF/s** | **4 ms** | **36 ms** | 143 MB | 0 % |
-| pdfjs, Node × 12 (cluster) | 1,957 PDF/s | 12 ms | 232 ms | ~2 GB | 0 % |
-| pdfjs, Node × 1 | 339 PDF/s | 41 ms | 1,735 ms | 216 MB | 0 % |
-| **pdfrs, 1 core** (`--cpus 1`, `WORKERS=1`) | **1,210 PDF/s** | 15 ms | 246 ms | **28 MB** | 0 % |
-| pdfjs, Node × 1 on 1 core | 266 PDF/s | 70 ms | 3,783 ms | 210 MB | 0 % |
+| **pdfrs, 12 threads** | **6,044 PDF/s** | **4 ms** | **43 ms** | 152 MB | 0 % |
+| pdfjs, Node × 12 (cluster) | 1,414 PDF/s | 18 ms | 289 ms | ~2 GB | 0 % |
+| pdfjs, Node × 1 | 280 PDF/s | 52 ms | 1,475 ms | 213 MB | 0 % |
+| **pdfrs, 1 core** (`--cpus 1`, `WORKERS=1`) | **1,057 PDF/s** | 16 ms | 271 ms | **29 MB** | 0 % |
+| pdfjs, Node × 1 on 1 core | 225 PDF/s | 77 ms | 4,677 ms | 203 MB | 0 % |
 
-- **Core for core, pdfrs renders ~4.5× more PDFs than pdfjs, with ~7× less memory.** On the whole machine: ~3.5× the throughput of clustered Node, for ~15× less memory.
+- **Core for core, pdfrs renders ~4.7× more PDFs than pdfjs, with ~7× less memory.** On the whole machine: ~4.3× the throughput of clustered Node, for ~13× less memory.
 - Rendering is CPU-bound: render threads (`WORKERS`, one per core by default) work in parallel within a single process, without duplicating fonts or the runtime; extra requests wait their turn, so latency rises without losing throughput.
-- Under load, Node × 1 loses throughput (GC) as the queue grows; pdfrs stays stable.
+- Under load, Node × 1 loses throughput (GC) as the queue grows (225 → 89 PDF/s at 200 users on one core); pdfrs stays stable.
+- The features added since 0.1 (grid, gradients, shadows, counters, floats, named pages, remote resources…) cost ~2–3 % per document on these documents (`examples/bench.rs`, 0.2.0 against 0.3.0, same machine and run).
 - The image sets `MIMALLOC_PURGE_DELAY=0` and `MIMALLOC_ARENA_EAGER_COMMIT=0`: the allocator returns freed memory right away (−50 % memory under load, same throughput).
-- Container startup: a few milliseconds; 20 MB image (static binary + 14 fonts), ~25 MB of memory at idle.
+- Container startup: a few milliseconds; 24 MB image (static binary with its HTTPS client + 14 fonts), ~25 MB of memory at idle.
 
 To reproduce (Docker is enough, with pdfjs cloned alongside):
 
