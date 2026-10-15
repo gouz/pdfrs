@@ -205,6 +205,8 @@ pub struct Tree {
     pub cells: std::collections::HashSet<NodeId>,
     /// elements with `background-clip: text` (Brush::text_fill - 1)
     pub text_fills: Vec<NodeId>,
+    /// top-level boxes with a `page` name
+    top_pages: HashMap<NodeId, Rc<str>>,
 }
 
 #[derive(Clone)]
@@ -249,6 +251,7 @@ struct Builder<'a> {
     /// `background-clip: text` elements (their node, once built), and the one painting the current text
     text_fills: Vec<Option<NodeId>>,
     text_fill: u32,
+    top_pages: HashMap<NodeId, Rc<str>>,
     /// decoded background images by url (the same image is often repeated on many boxes)
     bg_images: HashMap<Rc<str>, Option<(ImageKind, (f32, f32))>>,
 }
@@ -470,6 +473,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             first_line: None,
             text_fills: Vec::new(),
             text_fill: 0,
+            top_pages: HashMap::new(),
             bg_images: HashMap::new(),
         };
         b.taffy.disable_rounding();
@@ -487,7 +491,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.bg = body_style.bg.clone().or(html_style.bg.clone());
         b.apply_counters(body, &body_style, &mut Vec::new());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, footers: b.footers, cells: b.cells, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect() }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, headers: b.headers, footers: b.footers, cells: b.cells, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect(), top_pages: b.top_pages }
     })
 }
 
@@ -1109,9 +1113,13 @@ impl Builder<'_> {
                         }
                         _ => {
                             self.flush(ctx, container);
+                            let page = cs.page.clone().filter(|_| self.box_depth == 0);
                             self.box_depth += 1;
                             if let Some(n) = self.build_box(el, cs) {
                                 ctx.children.push(n);
+                                if let Some(page) = page {
+                                    self.top_pages.insert(n, page);
+                                }
                             }
                             self.box_depth -= 1;
                         }
@@ -1519,9 +1527,9 @@ impl Tree {
     /// Lay the tree out and set every text leaf's final line breaks and alignment.
     /// Lay out, then style the `::first-line` of the blocks that have one (needs fonts: that text
     /// is shaped again) and lay out once more if it changed.
-    pub fn compute_with_fonts(&mut self, width: f32, fcx: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
-        self.compute(width);
-        let leaves: Vec<NodeId> = self.taffy_leaves().into_iter().filter(|n| matches!(self.taffy.get_node_context(*n), Some(Leaf::Text(t)) if t.first_line.is_some())).collect();
+    pub fn compute_with_fonts(&mut self, root: NodeId, width: f32, fcx: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
+        self.compute_root(root, width);
+        let leaves: Vec<NodeId> = self.taffy_leaves(root).into_iter().filter(|n| matches!(self.taffy.get_node_context(*n), Some(Leaf::Text(t)) if t.first_line.is_some())).collect();
         if leaves.is_empty() {
             return;
         }
@@ -1556,13 +1564,56 @@ impl Tree {
             let _ = self.taffy.mark_dirty(leaf);
         }
         if changed {
-            self.compute(width);
+            self.compute_root(root, width);
         }
     }
 
-    fn taffy_leaves(&self) -> Vec<NodeId> {
+    /// Split the root into sections of consecutive top-level boxes with the same `page` name, each
+    /// its own root (a copy of the body box) to lay out at its page's width. One section without a
+    /// name: the root as is.
+    pub fn sections(&mut self) -> Vec<(NodeId, Option<Rc<str>>)> {
+        let children = self.taffy.children(self.root).unwrap_or_default();
+        let mut groups: Vec<(Option<Rc<str>>, Vec<NodeId>)> = Vec::new();
+        for c in children {
+            let name = self.top_pages.get(&c).cloned();
+            match groups.last_mut() {
+                Some(g) if g.0 == name => g.1.push(c),
+                _ => groups.push((name, vec![c])),
+            }
+        }
+        if groups.len() <= 1 && groups.first().is_none_or(|g| g.0.is_none()) {
+            return vec![(self.root, groups.pop().and_then(|g| g.0))];
+        }
+        let style = self.taffy.style(self.root).cloned().unwrap_or_default();
+        let deco = self.deco.get(&self.root).cloned();
         let mut out = Vec::new();
-        let mut stack = vec![self.root];
+        for (i, (name, nodes)) in groups.into_iter().enumerate() {
+            let root = if i == 0 {
+                let _ = self.taffy.set_children(self.root, &nodes);
+                self.root
+            } else {
+                let r = self.taffy.new_with_children(style.clone(), &nodes).unwrap_or(self.root);
+                if let Some(d) = &deco {
+                    self.deco.insert(r, d.clone());
+                }
+                r
+            };
+            out.push((root, name));
+        }
+        out
+    }
+
+    /// Lay a section root out at `width`.
+    pub fn set_width(&mut self, root: NodeId, width: f32) {
+        if let Ok(mut st) = self.taffy.style(root).cloned() {
+            st.size.width = Dimension::length(width);
+            let _ = self.taffy.set_style(root, st);
+        }
+    }
+
+    fn taffy_leaves(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
         stack.extend(self.inline.iter().map(|i| i.0));
         while let Some(n) = stack.pop() {
             let children = self.taffy.children(n).unwrap_or_default();
@@ -1575,9 +1626,13 @@ impl Tree {
     }
 
     pub fn compute(&mut self, width: f32) {
+        self.compute_root(self.root, width);
+    }
+
+    pub fn compute_root(&mut self, root: NodeId, width: f32) {
         let space = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
         self.size_inline_boxes();
-        let _ = self.taffy.compute_layout_with_measure(self.root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+        let _ = self.taffy.compute_layout_with_measure(root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
         // calc(px + pct%) resolved against the containing block just laid out, inline boxes wider
         // than their line shrunk to it (shrink-to-fit): then lay out again
         for _ in 0..4 {
@@ -1586,9 +1641,9 @@ impl Tree {
             if !calc && !fit {
                 break;
             }
-            let _ = self.taffy.compute_layout_with_measure(self.root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+            let _ = self.taffy.compute_layout_with_measure(root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
         }
-        self.finish_text(self.root);
+        self.finish_text(root);
     }
 
     /// Final line breaks and alignment of the text leaves of a subtree, at their laid out width.

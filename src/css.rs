@@ -22,6 +22,8 @@ pub enum Pseudo {
 /// An `@page` rule: page properties, and its margin boxes (`@top-center { content: ... }`).
 #[derive(Clone, Debug, Default)]
 pub struct PageRule {
+    /// `@page wide` (pages of elements with `page: wide`); None for every page
+    pub name: Option<String>,
     /// `:first`, `:left`, `:right`; None for `@page` itself
     pub pseudo: Option<String>,
     pub decls: Vec<Decl>,
@@ -137,9 +139,15 @@ fn parse_block(css: &str, media: &Media, sheet: &mut Sheet, depth: usize) {
                 "media" if depth < 8 && media_matches(args, media) => parse_block(body, media, sheet, depth + 1),
                 "supports" if depth < 8 => parse_block(body, media, sheet, depth + 1),
                 // the default page and `:first`; `:left` / `:right` / named pages are not supported
-                "page" if matches!(args.trim(), "" | ":first" | ":left" | ":right") => {
-                    let pseudo = Some(args.trim().to_ascii_lowercase()).filter(|p| !p.is_empty());
-                    sheet.pages.push(parse_page(body, pseudo))
+                "page" => {
+                    // `@page`, `@page :first`, `@page wide`, `@page wide:left`
+                    let args = args.trim();
+                    let (name, pseudo) = args.split_once(':').map_or((args, None), |(n, p)| (n, Some(format!(":{}", p.trim().to_ascii_lowercase()))));
+                    if pseudo.as_deref().is_none_or(|p| matches!(p, ":first" | ":left" | ":right")) {
+                        let mut rule = parse_page(body, pseudo);
+                        rule.name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
+                        sheet.pages.push(rule);
+                    }
                 }
                 "font-face" => sheet.font_faces.push(parse_declarations(body)),
                 _ => {}

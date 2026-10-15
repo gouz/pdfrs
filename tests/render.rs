@@ -544,3 +544,29 @@ fn first_line() {
     let all: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
     assert_eq!(all, words_in);
 }
+
+#[test]
+fn named_pages_make_sections() {
+    if !has_pdftotext() {
+        return;
+    }
+    let html = r#"<style>
+        @page { size: A5; @bottom-center { content: counter(page) "/" counter(pages) } }
+        @page wide { size: A5 landscape; @top-center { content: "PAYSAGE" } }
+        .wide { page: wide }
+        body { counter-reset: n } h2 { counter-increment: n } h2::before { content: counter(n) ". " }
+      </style>
+      <h2>Avant</h2><p>texte</p>
+      <div class="wide"><h2>Large</h2><p>tableau large</p></div>
+      <h2>Apres</h2>"#;
+    let out = pdf(html, &Options::default());
+    let raw = String::from_utf8_lossy(&out).into_owned();
+    // portrait, landscape, portrait, in this order
+    let boxes: Vec<&str> = raw.match_indices("MediaBox[").map(|(i, _)| &raw[i + 9..i + 9 + raw[i + 9..].find(']').unwrap()]).collect();
+    assert_eq!(boxes, ["0 0 419.53 595.28", "0 0 595.28 419.53", "0 0 419.53 595.28"]);
+    let text = text_of(&out);
+    let per_page: Vec<&str> = text.split('\x0c').collect();
+    assert!(per_page[0].contains("1. Avant") && per_page[0].contains("1/3"));
+    assert!(per_page[1].contains("PAYSAGE") && per_page[1].contains("2. Large") && per_page[1].contains("2/3"));
+    assert!(per_page[2].contains("3. Apres") && per_page[2].contains("3/3") && !per_page[2].contains("PAYSAGE"));
+}

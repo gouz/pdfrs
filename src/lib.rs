@@ -15,6 +15,7 @@ use css::{Decl, Media, PageRule};
 use krilla::page::PageSettings;
 use scraper::Html;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub use images::ImagePolicy;
 
@@ -91,7 +92,8 @@ fn band(html: &str, page: usize, pages: usize, o: &Options, width: f32, media: &
     let mut faces = faces.to_vec();
     faces.extend(layout::load_font_faces(&sheet.font_faces, &o.images));
     let mut t = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, width, &mut lcx.borrow_mut()));
-    compute(&mut t, width, &faces);
+    let root = t.root;
+    compute(&mut t, root, width, &faces);
     t
 }
 
@@ -164,13 +166,22 @@ fn page_kind(index: usize) -> PageKind {
     }
 }
 
-/// The `@page` rules of a kind of page, least specific first: `@page`, then `:left` / `:right`, then `:first`.
-fn rules_for(pages: &[PageRule], kind: PageKind) -> Vec<&PageRule> {
-    let level = |r: &PageRule| match (r.pseudo.as_deref(), kind) {
-        (None, _) => Some(0),
-        (Some(":left"), PageKind::Left) | (Some(":right"), PageKind::Right | PageKind::First) => Some(1),
-        (Some(":first"), PageKind::First) => Some(2),
-        _ => None,
+/// The `@page` rules of a kind of page with a `page` name, least specific first: `@page`, `@page name`,
+/// then `:left` / `:right`, then `:first` (each unnamed, then named).
+fn rules_for<'a>(pages: &'a [PageRule], kind: PageKind, name: Option<&str>) -> Vec<&'a PageRule> {
+    let level = |r: &PageRule| {
+        let named = match (r.name.as_deref(), name) {
+            (None, _) => 0,
+            (Some(a), Some(b)) if a == b => 1,
+            _ => return None,
+        };
+        let pseudo = match (r.pseudo.as_deref(), kind) {
+            (None, _) => 0,
+            (Some(":left"), PageKind::Left) | (Some(":right"), PageKind::Right | PageKind::First) => 2,
+            (Some(":first"), PageKind::First) => 4,
+            _ => return None,
+        };
+        Some(pseudo + named)
     };
     let mut rules: Vec<(u8, &PageRule)> = pages.iter().filter_map(|r| Some((level(r)?, r))).collect();
     rules.sort_by_key(|r| r.0);
@@ -180,20 +191,24 @@ fn rules_for(pages: &[PageRule], kind: PageKind) -> Vec<&PageRule> {
 /// Page size (landscape applied), content width, and the margins of each kind of page: the request's
 /// options, else the document's `@page` rules, else A4 / 40pt. The column has one width: a page whose
 /// side margins add up differently keeps its left margin and the common width.
-fn page_setup(o: &Options, pages: &[PageRule]) -> ((f32, f32), f32, [[f32; 4]; 3]) {
+fn page_setup(o: &Options, pages: &[PageRule], name: Option<&str>) -> ((f32, f32), f32, [[f32; 4]; 3]) {
     fn decls(rules: Vec<&PageRule>) -> Vec<&Decl> {
         rules.into_iter().flat_map(|p| &p.decls).collect()
     }
-    let base = page_props(o, &decls(pages.iter().filter(|p| p.pseudo.is_none()).collect()), PageProps::default());
-    let (w, h) = o.size.or(base.size).unwrap_or_else(|| page_size("A4").unwrap());
-    let (pw, ph) = if o.landscape.or(base.landscape).unwrap_or(false) { (w.max(h), w.min(h)) } else { (w, h) };
+    let base_rules: Vec<&PageRule> = rules_for(pages, PageKind::Right, name).into_iter().filter(|p| p.pseudo.is_none()).collect();
+    let base = page_props(o, &decls(base_rules), PageProps::default());
+    // a named page's own size wins over the request's (that is the point of naming it)
+    let named_size = name.is_some() && pages.iter().any(|p| p.name.as_deref() == name && p.decls.iter().any(|d| d.prop == "size"));
+    let (w, h) = if named_size { base.size } else { o.size.or(base.size) }.unwrap_or_else(|| page_size("A4").unwrap());
+    let landscape = if named_size { base.landscape } else { o.landscape.or(base.landscape) };
+    let (pw, ph) = if landscape.unwrap_or(false) { (w.max(h), w.min(h)) } else { (w, h) };
     let base_m = o.margin.unwrap_or(base.margin.map(|m| m.unwrap_or(40.0)));
     let cw = (pw - base_m[1] - base_m[3]).max(1.0);
     let margins = [PageKind::First, PageKind::Left, PageKind::Right].map(|kind| {
         let mut m = match o.margin {
             Some(m) => m,
             None => {
-                let p = page_props(o, &decls(rules_for(pages, kind)), PageProps::default());
+                let p = page_props(o, &decls(rules_for(pages, kind, name)), PageProps::default());
                 std::array::from_fn(|i| p.margin[i].unwrap_or(base_m[i]))
             }
         };
@@ -214,10 +229,10 @@ fn kind_index(kind: PageKind) -> usize {
 /// The `@page` margin boxes of a kind of page as HTML in their rectangle (x, y, w, h):
 /// edges (left / center / right side by side), corners and sides. `counter(page)` / `counter(pages)`
 /// become `{page}` / `{pages}`. The request's header / footer replace the top / bottom edges.
-fn margin_bands(o: &Options, pages: &[PageRule], kind: PageKind, (pw, ph): (f32, f32), m: [f32; 4]) -> Vec<(String, (f32, f32, f32, f32))> {
+fn margin_bands(o: &Options, pages: &[PageRule], kind: PageKind, name: Option<&str>, (pw, ph): (f32, f32), m: [f32; 4]) -> Vec<(String, (f32, f32, f32, f32))> {
     let [mt, mr, mb, ml] = m;
     let mut boxes: Vec<(&str, &[Decl])> = Vec::new();
-    for rule in rules_for(pages, kind) {
+    for rule in rules_for(pages, kind, name) {
         for (name, decls) in &rule.boxes {
             boxes.retain(|b| b.0 != name);
             boxes.push((name, decls));
@@ -266,9 +281,9 @@ fn margin_bands(o: &Options, pages: &[PageRule], kind: PageKind, (pw, ph): (f32,
     out
 }
 
-/// Lay a tree out (with the fonts, for its `::first-line`).
-fn compute(tree: &mut layout::Tree, width: f32, faces: &[fonts::DocFace]) {
-    LCX.with(|lcx| fonts::with_doc_font_cx(faces, |fcx| tree.compute_with_fonts(width, fcx, &mut lcx.borrow_mut())));
+/// Lay a tree (or one of its section roots) out, with the fonts for `::first-line`.
+fn compute(tree: &mut layout::Tree, root: taffy::NodeId, width: f32, faces: &[fonts::DocFace]) {
+    LCX.with(|lcx| fonts::with_doc_font_cx(faces, |fcx| tree.compute_with_fonts(root, width, fcx, &mut lcx.borrow_mut())));
 }
 
 /// Forgets the document's @font-face fonts, however the render ends.
@@ -290,27 +305,50 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     // @page first (it can sit in @media print), then the sheets for the real page area
     let provisional = Media { width: 515.28, height: 761.89 };
     let sheet = layout::stylesheet(&doc, &provisional, &o.images);
-    let ((pw, ph), cw, margins) = page_setup(o, &sheet.pages);
+    let ((_, ph), cw, margins) = page_setup(o, &sheet.pages, None);
     let ch = (ph - margins[2][0] - margins[2][2]).max(1.0);
     let media = Media { width: cw, height: ch };
     let sheet = if (cw - provisional.width).abs() < 0.5 && (ch - provisional.height).abs() < 0.5 { sheet } else { layout::stylesheet(&doc, &media, &o.images) };
     let faces = layout::load_font_faces(&sheet.font_faces, &o.images);
 
     let mut tree = LCX.with(|lcx| layout::build(&doc, &sheet, &faces, &o.images, &o.font, o.font_size, cw, &mut lcx.borrow_mut()));
-    compute(&mut tree, cw, &faces);
+    // sections of named pages (`page: wide`), each laid out at the width of its pages
+    struct Section {
+        root: taffy::NodeId,
+        name: Option<std::rc::Rc<str>>,
+        size: (f32, f32),
+        margins: [[f32; 4]; 3],
+    }
+    let mut sections = Vec::new();
+    for (root, name) in tree.sections() {
+        let (size, scw, margins) = page_setup(o, &sheet.pages, name.as_deref());
+        tree.set_width(root, scw);
+        compute(&mut tree, root, scw, &faces);
+        sections.push(Section { root, name, size, margins });
+    }
     // the root's background goes to the whole page (the canvas), its borders stay on the root box
-    let canvas = tree.deco.get_mut(&tree.root).and_then(|d| {
-        let c = layout::Deco { background: d.background.take(), layers: std::mem::take(&mut d.layers), color_clip: d.color_clip, ..Default::default() };
-        (c.background.is_some() || !c.layers.is_empty()).then_some(c)
-    });
-    let breaks = render::collect_breaks(&tree);
-    let height_of = |i: usize| {
-        let m = margins[kind_index(page_kind(i))];
-        (ph - m[0] - m[2]).max(1.0)
-    };
-    let pages = render::paginate(height_of, &breaks);
-    // header / footer (the request's, else the @page margin boxes) of each kind of page
-    let bands = [PageKind::First, PageKind::Left, PageKind::Right].map(|k| margin_bands(o, &sheet.pages, k, (pw, ph), margins[kind_index(k)]));
+    let mut canvas = None;
+    for sec in &sections {
+        if let Some(d) = tree.deco.get_mut(&sec.root) {
+            let c = layout::Deco { background: d.background.take(), layers: std::mem::take(&mut d.layers), color_clip: d.color_clip, ..Default::default() };
+            if canvas.is_none() && (c.background.is_some() || !c.layers.is_empty()) {
+                canvas = Some(c);
+            }
+        }
+    }
+    // pages of every section, numbered across sections (left / right / first by global index)
+    let mut pages: Vec<(usize, render::Page)> = Vec::new();
+    for (si, sec) in sections.iter().enumerate() {
+        let offset = pages.len();
+        let breaks = render::collect_breaks(&tree, sec.root);
+        let height_of = |i: usize| {
+            let m = sec.margins[kind_index(page_kind(offset + i))];
+            (sec.size.1 - m[0] - m[2]).max(1.0)
+        };
+        pages.extend(render::paginate(height_of, &breaks).into_iter().map(|p| (si, p)));
+    }
+    // header / footer (the request's, else the @page margin boxes) per section and kind of page
+    let mut bands: HashMap<(usize, usize), Vec<(String, (f32, f32, f32, f32))>> = HashMap::new();
 
     let mut doc = krilla::Document::new();
     let mut meta = krilla::metadata::Metadata::new().creator("pdfrs".into()).producer("pdfrs".into());
@@ -330,10 +368,14 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     doc.set_metadata(meta);
 
     let n = pages.len();
-    for (i, pg) in pages.iter().enumerate() {
+    for (i, (si, pg)) in pages.iter().enumerate() {
+        let sec = &sections[*si];
         let (start, end) = (pg.start, pg.end);
-        let k = kind_index(page_kind(i));
-        let [mt, _, _, ml] = margins[k];
+        let kind = page_kind(i);
+        let k = kind_index(kind);
+        let [mt, _, _, ml] = sec.margins[k];
+        let (pw, ph) = sec.size;
+        let page_bands = bands.entry((*si, k)).or_insert_with(|| margin_bands(o, &sheet.pages, kind, sec.name.as_deref(), (pw, ph), sec.margins[k]));
         let mut page = doc.start_page_with(PageSettings::from_wh(pw, ph).ok_or("invalid page size")?);
         // (x, y, w, h, href) in page coordinates
         let mut links: Vec<(f32, f32, f32, f32, String)> = Vec::new();
@@ -357,7 +399,7 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
                 let mut found = Vec::new();
                 s.push_clip_path(&clip, &krilla::paint::FillRule::NonZero);
                 s.push_transform(&krilla::geom::Transform::from_translate(ml, top - start));
-                render::draw(&mut s, &tree, tree.root, 0.0, 0.0, (start, end), &mut found);
+                render::draw(&mut s, &tree, sec.root, 0.0, 0.0, (start, end), &mut found);
                 s.pop();
                 s.pop();
                 links.extend(found.into_iter().filter_map(|l| {
@@ -378,7 +420,7 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
                 s.pop();
             }
             // header / footer, vertically centered in their margin
-            for (html, (bx, by, bw, bh)) in &bands[k] {
+            for (html, (bx, by, bw, bh)) in page_bands.iter() {
                 let t = band(html, i + 1, n, o, *bw, &media, &faces);
                 let th = t.taffy.layout(t.root).map(|l| l.size.height).unwrap_or(0.0);
                 let y = by + (bh - th) / 2.0;

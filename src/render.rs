@@ -58,9 +58,9 @@ impl Page {
     }
 }
 
-pub fn collect_breaks(tree: &Tree) -> Breaks {
+pub fn collect_breaks(tree: &Tree, root: NodeId) -> Breaks {
     let mut b = Breaks::default();
-    walk_breaks(tree, tree.root, 0.0, 0.0, &mut b);
+    walk_breaks(tree, root, 0.0, 0.0, &mut b);
     b.bottom = b.atoms.iter().map(|a| a.1).fold(b.bottom, f32::max);
     b.atoms.sort_by(|a, b| a.0.total_cmp(&b.0));
     b.forced.sort_by(f32::total_cmp);
@@ -895,7 +895,11 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
         let reach = d.shadows.as_ref().map_or(0.0, |sh| sh.iter().map(|s| s.dy.abs() + s.spread.max(0.0) + 1.5 * s.blur).fold(0.0, f32::max));
         if y - reach < window.1 && y + h + reach > window.0 {
             // the page area in column coordinates, for fixed backgrounds (main column only)
-            let page = (window.1 - window.0 < 1e6).then(|| (0.0, window.0, tree.taffy.layout(tree.root).map_or(0.0, |r| r.size.width), window.1 - window.0));
+            let mut top = n;
+            while let Some(p) = tree.taffy.parent(top) {
+                top = p;
+            }
+            let page = (window.1 - window.0 < 1e6).then(|| (0.0, window.0, tree.taffy.layout(top).map_or(0.0, |r| r.size.width), window.1 - window.0));
             draw_box(s, d, x, y, w, h, [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left], window, page);
         }
         if d.clip {

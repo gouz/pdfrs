@@ -265,6 +265,8 @@ pub struct Style {
     pub counter_reset: Option<Rc<Vec<(String, i32)>>>,
     pub counter_increment: Option<Rc<Vec<(String, i32)>>>,
     pub counter_set: Option<Rc<Vec<(String, i32)>>>,
+    /// `page: name`: the named @page of a top-level element
+    pub page: Option<Rc<str>>,
     pub opacity: f32,
     /// `transform` / `transform-origin`, resolved at draw time (they depend on the box size)
     pub transform_fn: Option<Rc<str>>,
@@ -343,6 +345,7 @@ impl Style {
             counter_reset: None,
             counter_increment: None,
             counter_set: None,
+            page: None,
             opacity: 1.0,
             transform_fn: None,
             transform_origin: None,
@@ -1427,6 +1430,7 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
         "counter-reset" => s.counter_reset = counter_list(&lv, 0),
         "counter-increment" => s.counter_increment = counter_list(&lv, 1),
         "counter-set" => s.counter_set = counter_list(&lv, 0),
+        "page" => s.page = (lv != "auto").then(|| v.trim().into()),
         "box-shadow" => s.shadows = if lv == "none" { None } else { shadows(v, em, rem, s.color).map(Rc::new) },
         "direction" => s.rtl = lv == "rtl",
         "content" => s.content = Some(v.trim().into()),
