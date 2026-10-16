@@ -1,6 +1,6 @@
 # pdfrs
 
-Generates PDFs from HTML/CSS, **without a browser**: a Rust port of [`@gouz/pdfjs`](https://github.com/gouz/pdfjs), shipped as a small HTTP API in a ~24 MB Docker image, **~4.7× faster per core and ~7× leaner in memory** (see [Performance](#performance)).
+Generates PDFs from HTML/CSS, **without a browser**: a Rust port of [`@gouz/pdfjs`](https://github.com/gouz/pdfjs), shipped as a small HTTP API in a ~80 MB distroless Docker image, **~4.7× faster per core and ~7× leaner in memory** (see [Performance](#performance)).
 
 - HTML parsing by [html5ever](https://github.com/servo/html5ever) (Servo's parser), CSS selectors by [`selectors`](https://crates.io/crates/selectors)
 - Layout by [Taffy](https://github.com/DioxusLabs/taffy): block (with margin collapsing), flexbox, **grid**, float — the counterpart of Yoga in react-pdf
@@ -308,7 +308,7 @@ Measured with [k6](https://k6.io), same scenario as pdfjs (`bench/k6.js`: POST t
 - Under load, Node × 1 loses throughput (GC) as the queue grows (225 → 89 PDF/s at 200 users on one core); pdfrs stays stable.
 - The features added since 0.1 (grid, gradients, shadows, counters, floats, named pages, remote resources…) cost ~2–3 % per document on these documents (`examples/bench.rs`, 0.2.0 against 0.3.0, same machine and run).
 - The image sets `MIMALLOC_PURGE_DELAY=0` and `MIMALLOC_ARENA_EAGER_COMMIT=0`: the allocator returns freed memory right away (−50 % memory under load, same throughput).
-- Container startup: a few milliseconds; 24 MB image (static binary with its HTTPS client + 14 fonts), ~25 MB of memory at idle.
+- Container startup: a few milliseconds; ~80 MB distroless image (binary with its HTTPS client + 14 fonts, glibc, CA certificates, tzdata), ~25 MB of memory at idle.
 
 To reproduce (Docker is enough, with pdfjs cloned alongside):
 
