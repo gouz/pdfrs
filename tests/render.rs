@@ -639,3 +639,104 @@ fn text_wraps_around_floats() {
     let lefts: Vec<f32> = w.iter().filter(|x| x.0.starts_with('w') && x.2 > first_y + 62.0).map(|x| x.1).collect();
     assert!(lefts.iter().any(|x| (x - 40.0).abs() < 1.0), "{lefts:?}");
 }
+
+/// Finding 03-p2: border-radius: 50% on border-only div (no fill) must render as circle, not rectangle.
+/// The percentage radius is resolved at render time against the element's dimensions.
+#[test]
+fn border_radius_pct_on_border_only_div() {
+    // a 60×60 div with border and border-radius: 50% but no background
+    // and a filled circle with border-radius: 50% — both must render without errors
+    let html = r#"<div style="width:60px;height:60px;border:3px solid #333;border-radius:50%"></div>
+                  <div style="width:60px;height:60px;background:#3498db;border-radius:50%"></div>
+                  <div style="width:120px;height:60px;background:#2ecc71;border-radius:50%"></div>"#;
+    let t = std::time::Instant::now();
+    let out = pdf(html, &Options::default());
+    assert!(out.starts_with(b"%PDF-"), "valid PDF produced");
+    // the PDF with border-radius must differ from one without (different path data)
+    let html_sharp = r#"<div style="width:60px;height:60px;border:3px solid #333;border-radius:0"></div>
+                         <div style="width:60px;height:60px;background:#3498db;border-radius:0"></div>
+                         <div style="width:120px;height:60px;background:#2ecc71;border-radius:0"></div>"#;
+    let out_sharp = pdf(html_sharp, &Options::default());
+    assert_ne!(out, out_sharp, "border-radius: 50% must produce different output than border-radius: 0");
+    assert!(t.elapsed().as_secs_f32() < 5.0, "no performance regression");
+}
+
+/// Finding 04-p1: numbered steps counter circle must render as circle with visible number.
+#[test]
+fn step_counter_circle_renders() {
+    if !has_pdftotext() {
+        return;
+    }
+    let html = r#"<style>
+        :root { --accent: #e74c3c; --bg: #ecf0f1; --radius: 6px; }
+        .steps { counter-reset: step; }
+        .step { counter-increment: step; padding: 8px 8px 8px 40px; position: relative; margin-bottom: 6px; background: var(--bg); border-radius: var(--radius); }
+        .step::before { content: counter(step); position: absolute; left: 8px; top: 8px; width: 24px; height: 24px; background: var(--accent); color: white; border-radius: 50%; text-align: center; line-height: 24px; font-weight: bold; }
+    </style>
+    <div class="steps">
+        <div class="step">First step</div>
+        <div class="step">Second step</div>
+    </div>"#;
+    let out = pdf(html, &Options::default());
+    let text = text_of(&out);
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // counter numbers must be visible
+    assert!(flat.contains("1") && flat.contains("2"), "step numbers must be visible: {flat}");
+    assert!(flat.contains("First") && flat.contains("Second"), "step text must be visible: {flat}");
+}
+
+/// Finding 04-p2: var() nested with calc() — border-radius from calc'd var must be applied.
+/// The `/` in calc(var(--size) / 2) must not be confused with the CSS border-radius `/` separator.
+#[test]
+fn var_calc_border_radius() {
+    // --half: calc(var(--size) / 2) should give 40px border-radius on an 80px box (a circle)
+    let html = r#"<style>
+        .nested-var {
+            --size: 80px;
+            --half: calc(var(--size) / 2);
+            width: var(--size); height: var(--size);
+            border-radius: var(--half);
+            background: #e74c3c;
+        }
+    </style>
+    <div class="nested-var">x</div>"#;
+    let t = std::time::Instant::now();
+    let out = pdf(html, &Options::default());
+    assert!(out.starts_with(b"%PDF-"), "valid PDF produced");
+    // verify the radius resolved: the output must differ from border-radius: 0
+    let html_sharp = r#"<style>
+        .nested-var {
+            --size: 80px;
+            width: var(--size); height: var(--size);
+            border-radius: 0;
+            background: #e74c3c;
+        }
+    </style>
+    <div class="nested-var">x</div>"#;
+    let out_sharp = pdf(html_sharp, &Options::default());
+    assert_ne!(out, out_sharp, "calc'd var border-radius must differ from border-radius: 0");
+    assert!(t.elapsed().as_secs_f32() < 5.0, "no performance regression");
+}
+
+/// Finding 04-p2: ::first-letter drop cap — "L" must be visible as a floated large letter.
+#[test]
+fn drop_cap_first_letter_visible() {
+    if !has_pdftotext() {
+        return;
+    }
+    let html = r#"<style>
+        :root { --accent: #e74c3c; }
+        .drop-cap::first-letter { font-size: 36px; float: left; line-height: 1; margin-right: 4px; color: var(--accent); font-weight: bold; }
+    </style>
+    <p class="drop-cap">Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"#;
+    let out = pdf(html, &Options::default());
+    let text = text_of(&out);
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // pdftotext separates the floated drop cap "L" from "orem": both must be present
+    assert!(flat.contains("L") && flat.contains("orem"), "drop cap L must be visible: {flat}");
+    // the L glyph must have a bounding box near the left margin (it's a float)
+    let w = words(&out);
+    let l_word = w.iter().find(|x| x.0 == "L");
+    assert!(l_word.is_some(), "L word must have a bounding box in the PDF: {w:?}");
+    assert!(l_word.unwrap().1 < 60.0, "L should be near the left margin: x={}", l_word.unwrap().1);
+}

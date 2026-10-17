@@ -114,7 +114,7 @@ pub struct ImageLeaf {
     pub kind: ImageKind,
     pub natural: (f32, f32),
     pub fit: ObjectFit,
-    pub radius: [f32; 4],
+    pub radius: [Len; 4],
 }
 
 pub enum Leaf {
@@ -153,7 +153,7 @@ pub struct Deco {
     pub border_width: [f32; 4],
     pub border_style: [Option<BorderStyle>; 4],
     pub border_color: [Rgba; 4],
-    pub radius: [f32; 4],
+    pub radius: [Len; 4],
     pub opacity: f32,
     pub clip: bool,
     pub break_before: bool,
