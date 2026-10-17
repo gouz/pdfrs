@@ -327,6 +327,52 @@ fn tfoot_repeats_where_the_table_breaks() {
 }
 
 #[test]
+fn border_collapse_table_does_not_waste_pages() {
+    // Regression: with border-collapse, adjacent cells overlap by the border width.  The old
+    // code registered the full border-box of each cell as an unbreakable atom, so the overlap
+    // made cut_at cascade backwards through every row, leaving only one body row per page.
+    let rows: String = (0..60).map(|i| format!("<tr><td>{i}</td><td>Item {i}</td><td>${i}.00</td></tr>")).collect();
+    let html = format!(
+        r#"<style>table {{ border-collapse: collapse }} th, td {{ border: 1px solid #333; padding: 6px }}</style>
+        <table><thead><tr><th>#</th><th>Item</th><th>Price</th></tr></thead>
+        <tfoot><tr><td colspan="3">End</td></tr></tfoot>
+        <tbody>{rows}</tbody></table>"#
+    );
+    let out = pdf(&html, &Options::default());
+    let n = pages(&out);
+    // 60 rows with ~27pt each = ~1620pt of body; A4 content height ~762pt → should fit in
+    // about 3 pages (with thead/tfoot repeated), never more than 5.
+    assert!(n <= 5, "border-collapse table used {n} pages for 60 rows (expected ≤ 5)");
+    assert!(n >= 2, "table should span at least 2 pages");
+}
+
+#[test]
+fn border_collapse_rows_all_present() {
+    if !has_pdftotext() {
+        return;
+    }
+    let rows: String = (0..60).map(|i| format!("<tr><td>r{i}</td><td>{i}</td></tr>")).collect();
+    let html = format!(
+        r#"<style>table {{ border-collapse: collapse }} th, td {{ border: 2px solid #333; padding: 8px }}</style>
+        <table><thead><tr><th>Entete</th><th>N</th></tr></thead>
+        <tfoot><tr><td colspan="2">Pied</td></tr></tfoot>
+        <tbody>{rows}</tbody></table>"#
+    );
+    let out = pdf(&html, &Options::default());
+    let n = pages(&out);
+    let text = text_of(&out);
+    // every row appears exactly once (match as whole words)
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for i in 0..60 {
+        let row = format!("r{i}");
+        assert_eq!(words.iter().filter(|w| **w == row).count(), 1, "row {row} count != 1");
+    }
+    // header and footer on every page
+    assert_eq!(text.matches("Entete").count(), n, "header count");
+    assert_eq!(text.matches("Pied").count(), n, "footer count");
+}
+
+#[test]
 fn link_stylesheet_comes_from_the_image_directory_only() {
     if !has_pdftotext() {
         return;
