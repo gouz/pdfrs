@@ -614,3 +614,27 @@ fn border_radius_pct_on_border_only_div() {
     assert_ne!(out, out_sharp, "border-radius: 50% must produce different output than border-radius: 0");
     assert!(t.elapsed().as_secs_f32() < 5.0, "no performance regression");
 }
+
+/// Finding 04-p1: numbered steps counter circle must render as circle with visible number.
+#[test]
+fn step_counter_circle_renders() {
+    if !has_pdftotext() {
+        return;
+    }
+    let html = r#"<style>
+        :root { --accent: #e74c3c; --bg: #ecf0f1; --radius: 6px; }
+        .steps { counter-reset: step; }
+        .step { counter-increment: step; padding: 8px 8px 8px 40px; position: relative; margin-bottom: 6px; background: var(--bg); border-radius: var(--radius); }
+        .step::before { content: counter(step); position: absolute; left: 8px; top: 8px; width: 24px; height: 24px; background: var(--accent); color: white; border-radius: 50%; text-align: center; line-height: 24px; font-weight: bold; }
+    </style>
+    <div class="steps">
+        <div class="step">First step</div>
+        <div class="step">Second step</div>
+    </div>"#;
+    let out = pdf(html, &Options::default());
+    let text = text_of(&out);
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // counter numbers must be visible
+    assert!(flat.contains("1") && flat.contains("2"), "step numbers must be visible: {flat}");
+    assert!(flat.contains("First") && flat.contains("Second"), "step text must be visible: {flat}");
+}
