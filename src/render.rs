@@ -107,7 +107,16 @@ fn walk_breaks(tree: &Tree, n: NodeId, ox: f32, oy: f32, b: &mut Breaks) {
         None => {}
     }
     if tree.cells.contains(&n) {
-        b.atoms.push((y, y + l.size.height));
+        // Use the padding box (excluding borders) so that adjacent cells in a border-collapse
+        // table do not produce overlapping atoms.  With collapsed borders the cells overlap by
+        // the border width (negative margin); using the full border box would make every pair
+        // of neighbours overlap, causing cut_at to cascade backwards through the entire table
+        // and leave only one row per page.
+        let top = y + l.border.top;
+        let bottom = y + l.size.height - l.border.bottom;
+        if bottom > top + 0.01 {
+            b.atoms.push((top, bottom));
+        }
     }
     for c in tree.taffy.child_ids(n) {
         walk_breaks(tree, c, x, y, b);
