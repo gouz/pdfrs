@@ -593,3 +593,24 @@ fn text_wraps_around_floats() {
     let lefts: Vec<f32> = w.iter().filter(|x| x.0.starts_with('w') && x.2 > first_y + 62.0).map(|x| x.1).collect();
     assert!(lefts.iter().any(|x| (x - 40.0).abs() < 1.0), "{lefts:?}");
 }
+
+/// Finding 03-p2: border-radius: 50% on border-only div (no fill) must render as circle, not rectangle.
+/// The percentage radius is resolved at render time against the element's dimensions.
+#[test]
+fn border_radius_pct_on_border_only_div() {
+    // a 60×60 div with border and border-radius: 50% but no background
+    // and a filled circle with border-radius: 50% — both must render without errors
+    let html = r#"<div style="width:60px;height:60px;border:3px solid #333;border-radius:50%"></div>
+                  <div style="width:60px;height:60px;background:#3498db;border-radius:50%"></div>
+                  <div style="width:120px;height:60px;background:#2ecc71;border-radius:50%"></div>"#;
+    let t = std::time::Instant::now();
+    let out = pdf(html, &Options::default());
+    assert!(out.starts_with(b"%PDF-"), "valid PDF produced");
+    // the PDF with border-radius must differ from one without (different path data)
+    let html_sharp = r#"<div style="width:60px;height:60px;border:3px solid #333;border-radius:0"></div>
+                         <div style="width:60px;height:60px;background:#3498db;border-radius:0"></div>
+                         <div style="width:120px;height:60px;background:#2ecc71;border-radius:0"></div>"#;
+    let out_sharp = pdf(html_sharp, &Options::default());
+    assert_ne!(out, out_sharp, "border-radius: 50% must produce different output than border-radius: 0");
+    assert!(t.elapsed().as_secs_f32() < 5.0, "no performance regression");
+}
