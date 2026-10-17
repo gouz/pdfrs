@@ -501,32 +501,32 @@ fn box_blur(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize, horizont
 }
 
 /// The border / padding / content box of a box, with its corner radii.
-fn area(which: BoxArea, (x, y, w, h): (f32, f32, f32, f32), d: &Deco, pad: [f32; 4]) -> ((f32, f32, f32, f32), [f32; 4]) {
-    let [bt, br, bb, bl] = d.border_width;
+fn area(which: BoxArea, (x, y, w, h): (f32, f32, f32, f32), radius: [f32; 4], border_width: [f32; 4], pad: [f32; 4]) -> ((f32, f32, f32, f32), [f32; 4]) {
+    let [bt, br, bb, bl] = border_width;
     let inset = |rect: (f32, f32, f32, f32), [t, r, b, l]: [f32; 4]| (rect.0 + l, rect.1 + t, (rect.2 - l - r).max(0.0), (rect.3 - t - b).max(0.0));
     let shrink = |radius: [f32; 4], [t, r, b, l]: [f32; 4]| [radius[0] - t.max(l), radius[1] - t.max(r), radius[2] - b.max(r), radius[3] - b.max(l)].map(|v| v.max(0.0));
     let border = (x, y, w, h);
     match which {
-        BoxArea::Border | BoxArea::Text => (border, d.radius),
-        BoxArea::Padding => (inset(border, d.border_width), shrink(d.radius, d.border_width)),
+        BoxArea::Border | BoxArea::Text => (border, radius),
+        BoxArea::Padding => (inset(border, border_width), shrink(radius, border_width)),
         BoxArea::Content => {
             let total = [bt + pad[0], br + pad[1], bb + pad[2], bl + pad[3]];
-            (inset(border, total), shrink(d.radius, total))
+            (inset(border, total), shrink(radius, total))
         }
     }
 }
 
 /// One background layer: tiles over its origin box, clipped to its clip box.
-fn draw_layer(s: &mut Surface, layer: &BgLayer, d: &Deco, rect: (f32, f32, f32, f32), pad: [f32; 4], window: (f32, f32), page: Option<(f32, f32, f32, f32)>) {
+fn draw_layer(s: &mut Surface, layer: &BgLayer, d: &Deco, rect: (f32, f32, f32, f32), radius: [f32; 4], pad: [f32; 4], window: (f32, f32), page: Option<(f32, f32, f32, f32)>) {
     if layer.clip == BoxArea::Text {
         return; // paints the text instead (draw_text)
     }
     // fixed: positioned against the page (repeated on every page), as browsers print it
     let ((ax, ay, aw, ah), _) = match page.filter(|_| layer.fixed) {
         Some(p) => (p, [0.0; 4]),
-        None => area(layer.origin, rect, d, pad),
+        None => area(layer.origin, rect, radius, d.border_width, pad),
     };
-    let ((cx, cy, cw, ch), cr) = area(layer.clip, rect, d, pad);
+    let ((cx, cy, cw, ch), cr) = area(layer.clip, rect, radius, d.border_width, pad);
     if aw <= 0.0 || ah <= 0.0 || cw <= 0.0 || ch <= 0.0 {
         return;
     }
@@ -615,11 +615,12 @@ fn draw_layer(s: &mut Surface, layer: &BgLayer, d: &Deco, rect: (f32, f32, f32, 
 #[allow(clippy::too_many_arguments)]
 fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, pad: [f32; 4], window: (f32, f32), page: Option<(f32, f32, f32, f32)>) {
     let rect = (x, y, w, h);
+    let radius = style::resolve_radius(d.radius, w, h);
     if let Some(shadows) = &d.shadows {
-        draw_shadows(s, shadows, d.radius, x, y, w, h);
+        draw_shadows(s, shadows, radius, x, y, w, h);
     }
     if let Some(bg) = d.background.filter(|_| d.color_clip != BoxArea::Text) {
-        let ((cx, cy, cw, ch), cr) = area(d.color_clip, rect, d, pad);
+        let ((cx, cy, cw, ch), cr) = area(d.color_clip, rect, radius, d.border_width, pad);
         if let Some(p) = rounded_path(cx, cy, cw, ch, cr) {
             s.set_stroke(None);
             s.set_fill(Some(fill(bg)));
@@ -627,10 +628,10 @@ fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, pad: [f32
         }
     }
     for layer in d.layers.iter().rev() {
-        draw_layer(s, layer, d, rect, pad, window, page);
+        draw_layer(s, layer, d, rect, radius, pad, window, page);
     }
     if let Some(shadows) = d.shadows.as_ref().filter(|sh| sh.iter().any(|s| s.inset)) {
-        let (inner, r) = area(BoxArea::Padding, rect, d, pad);
+        let (inner, r) = area(BoxArea::Padding, rect, radius, d.border_width, pad);
         draw_inset_shadows(s, shadows, inner, r);
     }
     let bw = d.border_width;
@@ -642,7 +643,7 @@ fn draw_box(s: &mut Surface, d: &Deco, x: f32, y: f32, w: f32, h: f32, pad: [f32
     if uniform && d.border_style[0] != Some(BorderStyle::Double) {
         // one stroke along the middle of the border
         let (w0, st) = (bw[0], d.border_style[0].unwrap_or(BorderStyle::Solid));
-        let r = d.radius.map(|r| (r - w0 / 2.0).max(0.0));
+        let r = radius.map(|r| (r - w0 / 2.0).max(0.0));
         if let Some(p) = rounded_path(x + w0 / 2.0, y + w0 / 2.0, w - w0, h - w0, r) {
             s.set_stroke(Some(stroke(d.border_color[0], w0, st)));
             s.draw_path(&p);
@@ -745,7 +746,8 @@ fn text_fill_paint(tree: &Tree, fill: u32, leaf: NodeId, x: f32, y: f32) -> Opti
     let (ex, ey) = tree_pos(tree, el);
     let rect = (ex + dx, ey + dy, el_l.size.width, el_l.size.height);
     let pad = [el_l.padding.top, el_l.padding.right, el_l.padding.bottom, el_l.padding.left];
-    let ((ax, ay, aw, ah), _) = area(layer.origin, rect, d, pad);
+    let radius = style::resolve_radius(d.radius, el_l.size.width, el_l.size.height);
+    let ((ax, ay, aw, ah), _) = area(layer.origin, rect, radius, d.border_width, pad);
     gradient_paint(g, ax, ay, aw, ah)
 }
 
@@ -845,9 +847,10 @@ fn draw_image(s: &mut Surface, img: &ImageLeaf, x: f32, y: f32, w: f32, h: f32) 
         }
         ObjectFit::None => (nw, nh),
     };
-    let clip = img.radius.iter().any(|r| *r > 0.0) || dw > w + 0.01 || dh > h + 0.01;
+    let radius = style::resolve_radius(img.radius, w, h);
+    let clip = radius.iter().any(|r| *r > 0.0) || dw > w + 0.01 || dh > h + 0.01;
     if clip {
-        if let Some(p) = rounded_path(x, y, w, h, img.radius) {
+        if let Some(p) = rounded_path(x, y, w, h, radius) {
             s.push_clip_path(&p, &FillRule::NonZero);
         }
     }
@@ -906,7 +909,7 @@ pub fn draw(s: &mut Surface, tree: &Tree, n: NodeId, ox: f32, oy: f32, window: (
             draw_box(s, d, x, y, w, h, [l.padding.top, l.padding.right, l.padding.bottom, l.padding.left], window, page);
         }
         if d.clip {
-            if let Some(p) = rounded_path(x, y, w, h, d.radius) {
+            if let Some(p) = rounded_path(x, y, w, h, style::resolve_radius(d.radius, w, h)) {
                 s.push_clip_path(&p, &FillRule::NonZero);
                 pushed += 1;
             }

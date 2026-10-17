@@ -8,8 +8,9 @@ use std::rc::Rc;
 use taffy::prelude::TaffyZero;
 use taffy::{AlignContent, AlignItems, Dimension, FlexDirection, FlexWrap, LengthPercentage, LengthPercentageAuto};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum Len {
+    #[default]
     Auto,
     Px(f32),
     Pct(f32),
@@ -255,8 +256,8 @@ pub struct Style {
     pub border_style: [BorderStyle; 4],
     /// None = currentColor
     pub border_color: [Option<Rgba>; 4],
-    /// top-left, top-right, bottom-right, bottom-left
-    pub radius: [f32; 4],
+    /// top-left, top-right, bottom-right, bottom-left (Pct = % of the box dimension)
+    pub radius: [Len; 4],
     pub background: Option<Rgba>,
     /// background image layers (`url()`, gradients) and their size / position / repeat / origin / clip
     pub bg: Option<Rc<Background>>,
@@ -338,7 +339,7 @@ impl Style {
             border_width: [0.0; 4],
             border_style: [BorderStyle::None; 4],
             border_color: [None; 4],
-            radius: [0.0; 4],
+            radius: [Len::Px(0.0); 4],
             background: None,
             bg: None,
             shadows: None,
@@ -954,6 +955,18 @@ pub fn resolve(l: Len, basis: f32) -> f32 {
     }
 }
 
+/// Resolve border-radius: percentages against w (horizontal) and h (vertical).
+/// CSS spec: horizontal radii resolve against width, vertical against height.
+/// Since we only support circular (not elliptical) radii, we average w and h for percentages.
+pub fn resolve_radius(r: [Len; 4], w: f32, h: f32) -> [f32; 4] {
+    r.map(|l| match l {
+        Len::Px(v) => v,
+        Len::Pct(p) => (w.min(h)) * p / 100.0,
+        Len::Calc(px, p) => px + (w.min(h)) * p / 100.0,
+        Len::Auto => 0.0,
+    })
+}
+
 /// `transform` functions -> affine matrix (a, b, c, d, e, f) for a box of w x h. None = identity / invalid.
 pub fn transform_matrix(v: &str, w: f32, h: f32, em: f32) -> Option<[f32; 6]> {
     let mul = |m: [f32; 6], n: [f32; 6]| {
@@ -1320,9 +1333,10 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
         }
         "border-radius" => {
             // `a b c d / e f g h`: elliptical radii unsupported, horizontal values used
-            let h = v.split('/').next().unwrap_or("");
+            // split on `/` outside parentheses so calc(x / y) is not broken
+            let h = crate::css::split_top_level(v, '/').next().unwrap_or("");
             if let Some(r) = lens(h, em, rem).and_then(|l| four(&l)) {
-                s.radius = r.map(|l| l.px().unwrap_or(0.0));
+                s.radius = r;
             }
         }
         "border-top-left-radius" | "border-top-right-radius" | "border-bottom-right-radius" | "border-bottom-left-radius" => {
@@ -1330,8 +1344,8 @@ fn apply(s: &mut Style, parent: &Style, prop: &str, v: &str, em: f32, rem: f32) 
                 .iter()
                 .position(|p| *p == prop)
                 .unwrap_or(0);
-            if let Some(Len::Px(r)) = v.split_whitespace().next().and_then(one) {
-                s.radius[i] = r;
+            if let Some(l) = v.split_whitespace().next().and_then(one) {
+                s.radius[i] = l;
             }
         }
         "border-collapse" => s.border_collapse = lv == "collapse",
@@ -1742,6 +1756,29 @@ mod tests {
         assert_eq!(l("min(10px, 2em, 50px)"), Some(Len::Px(10.0)));
         assert_eq!(l("clamp(5px, 100px, 30px)"), Some(Len::Px(30.0)));
         assert_eq!(resolve(Len::Calc(-20.0, 100.0), 200.0), 180.0);
+    }
+
+    #[test]
+    fn border_radius_pct_and_calc() {
+        // percentage radius
+        let s = computed("width: 60px; height: 60px; border: 3px solid black; border-radius: 50%");
+        assert_eq!(s.radius, [Len::Pct(50.0); 4]);
+        assert_eq!(resolve_radius(s.radius, 60.0, 60.0), [30.0; 4]);
+
+        // calc with division in border-radius — must not be split on the `/`
+        let s = computed("border-radius: calc(80px / 2)");
+        assert_eq!(s.radius, [Len::Px(40.0); 4]);
+        assert_eq!(resolve_radius(s.radius, 100.0, 100.0), [40.0; 4]);
+
+        // mixed: `border-radius: 10px 50%`
+        let s = computed("border-radius: 10px 50%");
+        assert_eq!(s.radius, [Len::Px(10.0), Len::Pct(50.0), Len::Px(10.0), Len::Pct(50.0)]);
+        let r = resolve_radius(s.radius, 80.0, 60.0);
+        assert_eq!(r, [10.0, 30.0, 10.0, 30.0]); // 50% of min(80,60) = 30
+
+        // individual corner with percentage
+        let s = computed("border-top-left-radius: 25%");
+        assert_eq!(s.radius[0], Len::Pct(25.0));
     }
 
     #[test]
