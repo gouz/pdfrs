@@ -638,3 +638,59 @@ fn step_counter_circle_renders() {
     assert!(flat.contains("1") && flat.contains("2"), "step numbers must be visible: {flat}");
     assert!(flat.contains("First") && flat.contains("Second"), "step text must be visible: {flat}");
 }
+
+/// Finding 04-p2: var() nested with calc() — border-radius from calc'd var must be applied.
+/// The `/` in calc(var(--size) / 2) must not be confused with the CSS border-radius `/` separator.
+#[test]
+fn var_calc_border_radius() {
+    // --half: calc(var(--size) / 2) should give 40px border-radius on an 80px box (a circle)
+    let html = r#"<style>
+        .nested-var {
+            --size: 80px;
+            --half: calc(var(--size) / 2);
+            width: var(--size); height: var(--size);
+            border-radius: var(--half);
+            background: #e74c3c;
+        }
+    </style>
+    <div class="nested-var">x</div>"#;
+    let t = std::time::Instant::now();
+    let out = pdf(html, &Options::default());
+    assert!(out.starts_with(b"%PDF-"), "valid PDF produced");
+    // verify the radius resolved: the output must differ from border-radius: 0
+    let html_sharp = r#"<style>
+        .nested-var {
+            --size: 80px;
+            width: var(--size); height: var(--size);
+            border-radius: 0;
+            background: #e74c3c;
+        }
+    </style>
+    <div class="nested-var">x</div>"#;
+    let out_sharp = pdf(html_sharp, &Options::default());
+    assert_ne!(out, out_sharp, "calc'd var border-radius must differ from border-radius: 0");
+    assert!(t.elapsed().as_secs_f32() < 5.0, "no performance regression");
+}
+
+/// Finding 04-p2: ::first-letter drop cap — "L" must be visible as a floated large letter.
+#[test]
+fn drop_cap_first_letter_visible() {
+    if !has_pdftotext() {
+        return;
+    }
+    let html = r#"<style>
+        :root { --accent: #e74c3c; }
+        .drop-cap::first-letter { font-size: 36px; float: left; line-height: 1; margin-right: 4px; color: var(--accent); font-weight: bold; }
+    </style>
+    <p class="drop-cap">Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"#;
+    let out = pdf(html, &Options::default());
+    let text = text_of(&out);
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // pdftotext separates the floated drop cap "L" from "orem": both must be present
+    assert!(flat.contains("L") && flat.contains("orem"), "drop cap L must be visible: {flat}");
+    // the L glyph must have a bounding box near the left margin (it's a float)
+    let w = words(&out);
+    let l_word = w.iter().find(|x| x.0 == "L");
+    assert!(l_word.is_some(), "L word must have a bounding box in the PDF: {w:?}");
+    assert!(l_word.unwrap().1 < 60.0, "L should be near the left margin: x={}", l_word.unwrap().1);
+}
