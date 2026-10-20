@@ -215,6 +215,8 @@ pub struct Tree {
     pub footers: HashMap<NodeId, Vec<NodeId>>,
     /// table cells: not split across pages when they fit on one
     pub cells: std::collections::HashSet<NodeId>,
+    /// tables with a width -> their auto columns, sized by Tree::fit_table_columns before the first layout
+    auto_columns: HashMap<NodeId, Vec<usize>>,
     /// elements with `background-clip: text` (Brush::text_fill - 1)
     pub text_fills: Vec<NodeId>,
     /// top-level boxes with a `page` name
@@ -259,6 +261,7 @@ struct Builder<'a> {
     headers: HashMap<NodeId, Vec<NodeId>>,
     footers: HashMap<NodeId, Vec<NodeId>>,
     cells: std::collections::HashSet<NodeId>,
+    auto_columns: HashMap<NodeId, Vec<usize>>,
     /// `::first-letter` style waiting for the first letter of the current block
     first_letter: Option<Rc<Style>>,
     /// `::first-line` declarations waiting for the first text of the current block
@@ -508,6 +511,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
             headers: HashMap::new(),
             footers: HashMap::new(),
             cells: Default::default(),
+            auto_columns: HashMap::new(),
             first_letter: None,
             first_line: None,
             text_fills: Vec::new(),
@@ -530,7 +534,7 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
         body_style.bg = body_style.bg.clone().or(html_style.bg.clone());
         b.apply_counters(body, &body_style, &mut Vec::new());
         let root = b.build_box(body, Rc::new(body_style)).unwrap_or_else(|| b.taffy.new_leaf(taffy::Style::default()).unwrap());
-        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, floats: b.floats, headers: b.headers, footers: b.footers, cells: b.cells, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect(), top_pages: b.top_pages }
+        Tree { taffy: b.taffy, root, deco: b.deco, links: b.links, calc: b.calc, inline: b.inline, floats: b.floats, headers: b.headers, footers: b.footers, cells: b.cells, auto_columns: b.auto_columns, text_fills: b.text_fills.into_iter().map(|n| n.unwrap_or(root)).collect(), top_pages: b.top_pages }
     })
 }
 
@@ -1493,11 +1497,21 @@ impl Builder<'_> {
         let mut ts = to_taffy(&s);
         ts.display = taffy::Display::Grid;
         ncols = ncols.max(widths.len());
-        // a given width is the column's preferred width: it still grows to fit its content
+        // a given width is the column's preferred width: it still grows to fit its content. In a table
+        // with a width, the room left goes (like Chromium) to the auto columns in proportion to their
+        // max-content width (see Tree::fit_table_columns), else to the fixed columns in proportion to
+        // their width, else to the percentages
+        let given = |c: usize| widths.get(c).copied().filter(|w| matches!(w, Len::Px(_) | Len::Pct(_)));
+        let wide = s.size[0] != Len::Auto;
+        let auto_cols: Vec<usize> = (0..ncols).filter(|c| given(*c).is_none()).collect();
+        let any_fixed = (0..ncols).any(|c| matches!(given(c), Some(Len::Px(_))));
+        let track = |max| minmax(MinTrackSizingFunction::auto(), max);
         ts.grid_template_columns = (0..ncols)
-            .map(|c| match widths.get(c) {
-                Some(Len::Px(v)) => minmax(MinTrackSizingFunction::auto(), MaxTrackSizingFunction::length(*v)),
-                Some(Len::Pct(v)) => minmax(MinTrackSizingFunction::auto(), MaxTrackSizingFunction::percent(v / 100.0)),
+            .map(|c| match given(c) {
+                Some(Len::Px(v)) if wide && auto_cols.is_empty() => track(MaxTrackSizingFunction::fr(v.max(0.01))),
+                Some(Len::Pct(v)) if wide && auto_cols.is_empty() && !any_fixed => track(MaxTrackSizingFunction::fr(v.max(0.01))),
+                Some(Len::Px(v)) => track(MaxTrackSizingFunction::length(v)),
+                Some(Len::Pct(v)) => track(MaxTrackSizingFunction::percent(v / 100.0)),
                 _ => taffy::GridTemplateComponent::AUTO,
             })
             .collect();
@@ -1508,6 +1522,9 @@ impl Builder<'_> {
             ts.justify_content = JustifyContent::START;
         }
         let node = self.taffy.new_with_children(ts, &children).ok()?;
+        if wide && !auto_cols.is_empty() {
+            self.auto_columns.insert(node, auto_cols);
+        }
         self.finish_node(node, &s);
         self.end_counter_scope(scope);
         if !header_cells.is_empty() {
@@ -1862,6 +1879,7 @@ impl Tree {
     pub fn compute_root(&mut self, root: NodeId, width: f32) {
         let space = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent };
         self.size_inline_boxes();
+        self.fit_table_columns(root);
         let _ = self.taffy.compute_layout_with_measure(root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
         // calc(px + pct%) resolved against the containing block just laid out, inline boxes wider
         // than their line shrunk to it (shrink-to-fit): then lay out again
@@ -1874,6 +1892,48 @@ impl Tree {
             let _ = self.taffy.compute_layout_with_measure(root, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
         }
         self.finish_text(root);
+    }
+
+    /// Auto columns of the tables with a width under `root`: each table laid out on its own at its
+    /// max-content width measures them, then they share the room left in proportion (`fr`).
+    fn fit_table_columns(&mut self, root: NodeId) {
+        let under = |taffy: &TaffyTree<Leaf>, mut n: NodeId| loop {
+            if n == root {
+                return true;
+            }
+            match taffy.parent(n) {
+                Some(p) => n = p,
+                None => return false,
+            }
+        };
+        let tables: Vec<NodeId> = self.auto_columns.keys().copied().filter(|t| under(&self.taffy, *t)).collect();
+        for table in tables {
+            let cols = self.auto_columns.remove(&table).unwrap_or_default();
+            let Ok(style) = self.taffy.style(table).cloned() else { continue };
+            let mut measure_style = style.clone();
+            measure_style.size.width = Dimension::auto();
+            measure_style.justify_content = JustifyContent::START;
+            let _ = self.taffy.set_style(table, measure_style);
+            let space = Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent };
+            let _ = self.taffy.compute_layout_with_measure(table, space, |inputs, _, leaf, style| measure(inputs, leaf, style));
+            // a column's max-content width: its widest cell spanning only it
+            let mut widths = vec![0.0f32; style.grid_template_columns.len()];
+            for cell in self.taffy.children(table).unwrap_or_default() {
+                let Ok(cs) = self.taffy.style(cell) else { continue };
+                if let (taffy::GridPlacement::Line(l), &taffy::GridPlacement::Span(1)) = (&cs.grid_column.start, &cs.grid_column.end) {
+                    if let Some(w) = usize::try_from(l.as_i16() - 1).ok().and_then(|c| widths.get_mut(c)) {
+                        *w = w.max(self.taffy.layout(cell).map_or(0.0, |l| l.size.width));
+                    }
+                }
+            }
+            let mut style = style;
+            for c in cols {
+                if let (Some(slot), Some(w)) = (style.grid_template_columns.get_mut(c), widths.get(c)) {
+                    *slot = minmax(MinTrackSizingFunction::auto(), MaxTrackSizingFunction::fr(w.max(0.01)));
+                }
+            }
+            let _ = self.taffy.set_style(table, style);
+        }
     }
 
     /// Final line breaks and alignment of the text leaves of a subtree, at their laid out width.

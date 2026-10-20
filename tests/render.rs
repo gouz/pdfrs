@@ -803,3 +803,33 @@ fn table_column_widths_from_colgroup_and_cells() {
     assert!((x(&html, "b") - 100.0).abs() < 1.0);
     assert!((x(&html, "c") - 250.0).abs() < 1.0);
 }
+
+/// A table with a width shares the room its columns leave like Chromium (values measured in Chromium 130).
+#[test]
+fn table_room_left_goes_to_the_columns_like_chromium() {
+    if !has_pdftotext() {
+        return;
+    }
+    let o = Options { margin: Some([0.0; 4]), ..Options::default() };
+    let html = r#"<style>table { border-spacing: 0 } td { padding: 0 }</style>
+        <table style="width:400pt"><tr><td style="width:100pt">A1</td><td style="width:100pt">A2</td></tr></table>
+        <table style="width:400pt"><tr><td style="width:20%">C1</td><td style="width:30%">C2</td></tr></table>
+        <table style="width:400pt"><tr><td style="width:100pt">D1</td><td style="width:25%">D2</td></tr></table>
+        <table style="width:400pt"><tr><td style="width:100pt">E1</td><td style="width:25%">E2</td><td>E3</td></tr></table>
+        <table><tr><td style="width:100pt">F1</td><td style="width:50pt">F2</td></tr></table>
+        <table style="width:400pt"><colgroup><col style="width:100pt"><col style="width:50pt"></colgroup><tr><td>G1</td><td>G2</td></tr></table>
+        <table style="width:400pt"><tr><td>H1</td><td>H2 wider content</td></tr></table>"#;
+    let w = words(&pdf(html, &o));
+    let x = |t: &str| w.iter().find(|w| w.0 == t).unwrap_or_else(|| panic!("{t}: {w:?}")).1;
+    // all fixed: in proportion to their widths; all percentages: scaled; fixed and %: the fixed one grows
+    assert!((x("A2") - 200.0).abs() < 1.0, "{}", x("A2"));
+    assert!((x("C2") - 160.0).abs() < 1.0, "{}", x("C2"));
+    assert!((x("D2") - 300.0).abs() < 1.0, "{}", x("D2"));
+    // an auto column takes the room, the others keep their width
+    assert!((x("E2") - 100.0).abs() < 1.0 && (x("E3") - 200.0).abs() < 1.0, "{} {}", x("E2"), x("E3"));
+    // a table without a width: as given
+    assert!((x("F2") - 100.0).abs() < 1.0, "{}", x("F2"));
+    assert!((x("G2") - 266.67).abs() < 1.0, "{}", x("G2"));
+    // auto columns: in proportion to their content, not evenly
+    assert!(x("H2") < 150.0, "{}", x("H2"));
+}
