@@ -245,10 +245,10 @@ fn shadows_and_background_images_render() {
     let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     let html = format!(
         r#"<div style="box-shadow: 0 4px 12px rgba(0,0,0,.3), 2px 2px 0 red, inset 0 0 4px blue; border-radius: 6px; height: 40px">a</div>
-           <div style="background: url({png}) repeat; background-size: 4px; height: 3000px; border-radius: 10px">tall, tiled</div>
+           <div style="background: url({png}) repeat; background-size: 4px; height: 3000pt; border-radius: 10px">tall, tiled</div>
            <div style="background: url({png}) center / cover no-repeat; width: 50%; height: 60px"></div>
            <div style="background-image: url(https://x.test/a.png); height: 10px"></div>
-           <div style="box-shadow: 0 0 400px 50px black; width: 5000px; height: 5000px"></div>"#
+           <div style="box-shadow: 0 0 400px 50px black; width: 5000pt; height: 5000pt"></div>"#
     );
     let t = std::time::Instant::now();
     let out = pdf(&html, &Options::default());
@@ -557,9 +557,9 @@ fn left_right_pages_and_all_margin_boxes() {
     let body = "<p>ligne</p>".repeat(150);
     let html = format!(
         r#"<style>
-        @page {{ margin: 50px 40px; @top-left-corner {{ content: "TL" }} @right-middle {{ content: "RM" }} @bottom-right-corner {{ content: counter(page) }} }}
-        @page :left {{ margin-left: 60px; margin-right: 20px; @top-center {{ content: "Gauche" }} }}
-        @page :right {{ margin-left: 20px; margin-right: 60px; @top-center {{ content: "Droite" }} }}
+        @page {{ margin: 50pt 40pt; @top-left-corner {{ content: "TL" }} @right-middle {{ content: "RM" }} @bottom-right-corner {{ content: counter(page) }} }}
+        @page :left {{ margin-left: 60pt; margin-right: 20pt; @top-center {{ content: "Gauche" }} }}
+        @page :right {{ margin-left: 20pt; margin-right: 60pt; @top-center {{ content: "Droite" }} }}
       </style>{body}"#
     );
     let out = pdf(&html, &Options::default());
@@ -628,7 +628,7 @@ fn text_wraps_around_floats() {
         return;
     }
     let text: String = (0..120).map(|i| format!("w{i} ")).collect();
-    let html = format!(r#"<p><span style="float:left;width:100px;height:60px;background:#ccc"></span>{text}</p><p style="float:right">x</p>"#);
+    let html = format!(r#"<p><span style="float:left;width:100pt;height:60pt;background:#ccc"></span>{text}</p><p style="float:right">x</p>"#);
     let w = words(&pdf(&html, &Options::default()));
     let line_x = |word: &str| w.iter().find(|x| x.0 == word).map(|x| (x.1, x.2)).unwrap();
     let (first_x, first_y) = line_x("w0");
@@ -739,4 +739,67 @@ fn drop_cap_first_letter_visible() {
     let l_word = w.iter().find(|x| x.0 == "L");
     assert!(l_word.is_some(), "L word must have a bounding box in the PDF: {w:?}");
     assert!(l_word.unwrap().1 < 60.0, "L should be near the left margin: x={}", l_word.unwrap().1);
+}
+
+#[test]
+fn page_rule_takes_root_variables() {
+    let html = "<style>:root { --m: 20mm; --size: A5 } @page { size: var(--size) landscape; margin: var(--m) } \
+        @page { @bottom-center { content: 'p' ; color: var(--nope) } }</style><p>x</p>";
+    let out = String::from_utf8_lossy(&pdf(html, &Options::default())).into_owned();
+    assert!(out.contains("MediaBox[0 0 595.28 419.53]"), "A5 landscape from var() expected");
+    if has_pdftotext() {
+        let w = words(&pdf(html, &Options::default()));
+        let x = w.iter().find(|w| w.0 == "x").unwrap();
+        assert!((x.1 - 20.0 * 72.0 / 25.4).abs() < 1.0, "margin from var(): {x:?}");
+    }
+}
+
+#[test]
+fn px_is_three_quarters_of_a_pt_and_viewport_units() {
+    if !has_pdftotext() {
+        return;
+    }
+    // A5 with 0 margin: 100vw = 419.53pt; 96px = 72pt
+    let o = Options { size: pdfrs::page_size("A5"), margin: Some([0.0; 4]), ..Options::default() };
+    let w = words(&pdf(r#"<p style="margin:0;padding-left:96px">a</p><p style="margin:0;padding-left:50vw">b</p><p style="margin:0;padding-left:calc(100vw - 100pt)">c</p>"#, &o));
+    let x = |t: &str| w.iter().find(|w| w.0 == t).unwrap().1;
+    assert!((x("a") - 72.0).abs() < 1.0, "96px = 72pt: {w:?}");
+    assert!((x("b") - 419.53 / 2.0).abs() < 1.0, "50vw: {w:?}");
+    assert!((x("c") - 319.53).abs() < 1.0, "calc with vw: {w:?}");
+}
+
+#[test]
+fn inline_children_of_a_grid_are_grid_items() {
+    if !has_pdftotext() {
+        return;
+    }
+    let o = Options { margin: Some([0.0; 4]), ..Options::default() };
+    let html = r#"<div style="display:grid;grid-template-columns:100pt 100pt 100pt"><span>a</span><span>b</span><a href="https://x.test">c</a></div>"#;
+    let out = pdf(html, &o);
+    let w = words(&out);
+    let x = |t: &str| w.iter().find(|w| w.0 == t).unwrap_or_else(|| panic!("{t}: {w:?}")).1;
+    assert!(x("a") < 5.0 && (x("b") - 100.0).abs() < 1.0 && (x("c") - 200.0).abs() < 1.0, "one span per cell: {w:?}");
+    assert!(String::from_utf8_lossy(&out).contains("https://x.test"), "a grid item <a> keeps its link");
+}
+
+#[test]
+fn table_column_widths_from_colgroup_and_cells() {
+    if !has_pdftotext() {
+        return;
+    }
+    let o = Options { margin: Some([0.0; 4]), ..Options::default() };
+    let x = |html: &str, t: &str| {
+        let w = words(&pdf(html, &o));
+        w.iter().find(|w| w.0 == t).unwrap_or_else(|| panic!("{t}: {w:?}")).1
+    };
+    let cells = "<tr><td>a</td><td>b</td><td>c</td></tr>";
+    let base = r#"<style>table { border-spacing: 0 } td, th { padding: 0; text-align: left }</style>"#;
+    // <col width> (px), <col style="width: %">, <colgroup span>
+    let html = format!(r#"{base}<table style="width:400pt"><colgroup><col width="200"><col style="width:25%"></colgroup><colgroup span="1"></colgroup>{cells}</table>"#);
+    assert!((x(&html, "b") - 150.0).abs() < 1.0);
+    assert!((x(&html, "c") - 250.0).abs() < 1.0);
+    // widths on the header cells: a percentage is of the table, not of the column
+    let html = format!(r#"{base}<table style="width:400pt"><tr><th style="width:25%">h1</th><th style="width:150pt">h2</th><th>h3</th></tr>{cells}</table>"#);
+    assert!((x(&html, "b") - 100.0).abs() < 1.0);
+    assert!((x(&html, "c") - 250.0).abs() < 1.0);
 }

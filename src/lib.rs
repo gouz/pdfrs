@@ -309,6 +309,7 @@ pub fn html_to_pdf(html: &str, o: &Options) -> Result<Vec<u8>, String> {
     let ((_, ph), cw, margins) = page_setup(o, &sheet.pages, None);
     let ch = (ph - margins[2][0] - margins[2][2]).max(1.0);
     let media = Media { width: cw, height: ch };
+    style::set_viewport(cw, ch);
     let sheet = if (cw - provisional.width).abs() < 0.5 && (ch - provisional.height).abs() < 0.5 { sheet } else { layout::stylesheet(&doc, &media, &o.images) };
     let faces = layout::load_font_faces(&sheet.font_faces, &o.images);
 

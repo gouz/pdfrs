@@ -239,11 +239,12 @@ fn media_feature(f: &str, m: &Media) -> bool {
         let unit = v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len());
         let n: f32 = v[..unit].trim().parse().ok()?;
         Some(match &v[unit..] {
-            "em" | "rem" => n * 16.0,
+            "em" | "rem" => n * 12.0,
             "in" => n * 72.0,
             "cm" => n * 72.0 / 2.54,
             "mm" => n * 72.0 / 25.4,
-            _ => n,
+            "pt" => n,
+            _ => n * crate::style::PX,
         })
     };
     // range syntax: `width >= 600px`

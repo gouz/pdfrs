@@ -1,6 +1,6 @@
 <style>
-  @page { size: A4; margin: 15mm }
-  :root { --accent: #2c6fbb; --soft: #eef4fb; --radius: 6px; }
+  :root { --accent: #2c6fbb; --soft: #eef4fb; --radius: 6px; --page-margin: 15mm; }
+  @page { size: A4; margin: var(--page-margin); @bottom-right { content: "pdfrs"; color: var(--accent); font-size: 9px } }
   body { font-family: "Segoe UI", sans-serif; color: #222 }
   h1 { color: var(--accent); margin-bottom: 4px }
   h2 { font-size: 13px; color: var(--accent); margin: 14px 0 6px; text-transform: uppercase; letter-spacing: 1px }
@@ -24,6 +24,12 @@
   @media (max-width: 400px) { .wide-only { display: none } }
   @media print { .print-note { color: #2a9d5c } }
   .rtl { direction: rtl; background: var(--soft); padding: 6px 10px }
+  .vw { width: 50vw; height: 4vh; background: linear-gradient(90deg, var(--accent), #6bc1ff); color: white; font-size: 10px; padding: 4px 8px; box-sizing: border-box }
+  .tags { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px }
+  .tags span { background: var(--soft); border-radius: var(--radius); padding: 4px; text-align: center; font-size: 10px }
+  .cols { width: 100%; border-collapse: collapse; font-size: 10px }
+  .cols th, .cols td { border: 1px solid #ccd; padding: 3px 6px; text-align: left }
+  .cols th { background: var(--soft) }
 </style>
 <h1>Lot 1 : nouveautés CSS</h1>
 <p class="print-note">Ce texte est vert grâce à <code>@media print</code>, la page est réglée par <code>@page</code>.</p>
@@ -48,3 +54,19 @@
 <h2>Droite à gauche</h2>
 <p class="rtl">שלום עולם — مرحبا بالعالم — 123 et du français</p>
 <ul dir="rtl"><li>פריט ראשון</li><li>عنصر ثاني</li></ul>
+
+<h2>Unités et tableaux</h2>
+<p>1px = 0,75pt comme dans un navigateur ; <code>vw</code> / <code>vh</code> sont relatifs à la zone de page, et la marge de <code>@page</code> vient d'une variable de <code>:root</code>.</p>
+<div class="vw">width: 50vw ; height: 4vh</div>
+<p>Chaque <code>&lt;span&gt;</code> d'une grille est une case :</p>
+<div class="tags"><span>alpha</span><span>beta</span><span>gamma</span><span>delta</span></div>
+<p>Largeurs de colonnes par <code>&lt;colgroup&gt;</code> puis par <code>&lt;th style="width"&gt;</code> :</p>
+<table class="cols">
+  <colgroup><col style="width: 15%"><col style="width: 60%"><col></colgroup>
+  <tr><th>Réf.</th><th>Désignation (60 %)</th><th>Prix</th></tr>
+  <tr><td>A-01</td><td>Développement</td><td>1 200 €</td></tr>
+</table>
+<table class="cols" style="margin-top: 6px">
+  <tr><th style="width: 40%">Désignation (40 %)</th><th style="width: 120px">Quantité (120px)</th><th>Prix</th></tr>
+  <tr><td>Formation</td><td>3</td><td>900 €</td></tr>
+</table>

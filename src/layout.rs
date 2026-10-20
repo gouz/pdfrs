@@ -293,7 +293,30 @@ pub fn stylesheet(doc: &Html, media: &Media, policy: &ImagePolicy) -> Sheet {
             }
         }
     }
+    page_vars(doc, &mut sheet);
     sheet
+}
+
+/// var() in `@page` rules and their margin boxes: the page context inherits the root element's custom properties.
+fn page_vars(doc: &Html, sheet: &mut Sheet) {
+    if !sheet.pages.iter().any(|p| p.decls.iter().chain(p.boxes.iter().flat_map(|b| &b.1)).any(|d| d.value.contains("var("))) {
+        return;
+    }
+    let root = doc.root_element();
+    let inline = attr(&root, "style").map(css::parse_declarations).unwrap_or_default();
+    let vars: HashMap<String, String> = css::matched(root, None, &UA, &sheet.rules, &inline).into_iter().filter(|d| d.prop.starts_with("--")).map(|d| (d.prop.clone(), d.value.clone())).collect();
+    for page in &mut sheet.pages {
+        for decls in std::iter::once(&mut page.decls).chain(page.boxes.iter_mut().map(|b| &mut b.1)) {
+            // a reference to an undefined variable without fallback drops the declaration, as in style rules
+            decls.retain_mut(|d| match style::substitute_vars(&d.value, Some(&vars), 0) {
+                Some(v) => {
+                    d.value = v.into_owned();
+                    true
+                }
+                None => false,
+            });
+        }
+    }
 }
 
 /// A stylesheet file: from the image directory, or http(s) when remote resources are enabled.
@@ -513,6 +536,14 @@ pub fn build(doc: &Html, sheet: &Sheet, faces: &[fonts::DocFace], policy: &Image
 
 fn attr<'a>(el: &ElementRef<'a>, name: &str) -> Option<&'a str> {
     el.value().attr(name)
+}
+
+/// A `width` / `height` attribute: a bare number is px (HTML), else a CSS length.
+fn html_len(v: &str, em: f32, rem: f32) -> Option<Len> {
+    match v.trim().parse::<f32>() {
+        Ok(n) => Some(Len::Px(n * style::PX)),
+        Err(_) => style::len(v, em, rem),
+    }
 }
 
 fn apply_transform(t: &str, tr: Transform) -> String {
@@ -797,16 +828,16 @@ fn deco_of(s: &Style) -> Deco {
     }
 }
 
-/// Decode image bytes: SVG, or PNG / JPEG / GIF / WebP. With the natural size in pt (1 px = 1 pt).
+/// Decode image bytes: SVG, or PNG / JPEG / GIF / WebP. With the natural size in pt (1 px = 0.75 pt).
 fn decode(data: Vec<u8>) -> Option<(ImageKind, (f32, f32))> {
     if images::is_svg(&data) {
         let tree = svg_tree(&String::from_utf8_lossy(&data))?;
-        let size = (tree.size().width(), tree.size().height());
+        let size = (tree.size().width() * style::PX, tree.size().height() * style::PX);
         Some((ImageKind::Svg(Arc::new(tree)), size))
     } else {
         let image = raster(data)?;
         let (w, h) = image.size();
-        Some((ImageKind::Raster(image), (w as f32, h as f32)))
+        Some((ImageKind::Raster(image), (w as f32 * style::PX, h as f32 * style::PX)))
     }
 }
 
@@ -1019,7 +1050,10 @@ impl Builder<'_> {
         if let Some(i) = fill_slot {
             self.text_fill = i as u32 + 1;
         }
-        let brush = Brush { text_fill: self.text_fill, ..brush_of(&s) };
+        let mut brush = Brush { text_fill: self.text_fill, ..brush_of(&s) };
+        if let Some(link) = self.link(el) {
+            brush.link = link;
+        }
         let (owns_first_letter, owns_first_line) = self.first_pseudos(el, &s);
         self.pseudo(el, &s, Pseudo::Before, &brush, &mut ctx, &s);
         self.walk(*el, &s, brush.clone(), &mut ctx, &s);
@@ -1078,10 +1112,13 @@ impl Builder<'_> {
                     if matches!(s.vertical_align, VAlign::Sub | VAlign::Super | VAlign::Length(_)) && cs.vertical_align == VAlign::Baseline && cs.display == Display::Inline {
                         cs.vertical_align = s.vertical_align;
                     }
-                    self.apply_counters(el, &cs, &mut scope);
-                    let cs = Rc::new(cs);
                     // children of a flex / grid box are its items, whatever their display (blockified)
                     let item = Some(parent.id()) == ctx.owner && matches!(container.display, Display::Flex | Display::Grid);
+                    if item && cs.display == Display::Inline && !matches!(el.value().name(), "br" | "img" | "svg") {
+                        cs.display = Display::Block;
+                    }
+                    self.apply_counters(el, &cs, &mut scope);
+                    let cs = Rc::new(cs);
                     let in_flow = !cs.position_absolute && cs.float == taffy::Float::None;
                     // a float in a block of text: laid out on its own, the text of the block wraps around it
                     if !item && cs.float != taffy::Float::None && !cs.position_absolute && self.box_depth < MAX_BOX_DEPTH {
@@ -1114,14 +1151,8 @@ impl Builder<'_> {
                             if cs.display == Display::Inline {
                                 b.background = cs.background.or(brush.background);
                             }
-                            if el.value().name() == "a" {
-                                if let Some(href) = attr(&el, "href").filter(|h| {
-                                    let h = h.to_ascii_lowercase();
-                                    h.starts_with("http://") || h.starts_with("https://") || h.starts_with("mailto:") || h.starts_with("tel:")
-                                }) {
-                                    self.links.push(href.to_string());
-                                    b.link = self.links.len() as u32;
-                                }
+                            if let Some(link) = self.link(el) {
+                                b.link = link;
                             }
                             self.pseudo(el, &cs, Pseudo::Before, &b, ctx, container);
                             self.walk(*el, &cs, b.clone(), ctx, container);
@@ -1153,6 +1184,19 @@ impl Builder<'_> {
             }
         }
         self.end_counter_scope(scope);
+    }
+
+    /// An `<a href>` to an external target: its 1-based index in Tree::links.
+    fn link(&mut self, el: ElementRef) -> Option<u32> {
+        if el.value().name() != "a" {
+            return None;
+        }
+        let href = attr(&el, "href").filter(|h| {
+            let h = h.to_ascii_lowercase();
+            h.starts_with("http://") || h.starts_with("https://") || h.starts_with("mailto:") || h.starts_with("tel:")
+        })?;
+        self.links.push(href.to_string());
+        Some(self.links.len() as u32)
     }
 
     /// A floated element as a box of its own, for the text of the block to wrap around.
@@ -1309,7 +1353,7 @@ impl Builder<'_> {
     fn replaced(&mut self, el: ElementRef, s: &Rc<Style>) -> Option<NodeId> {
         let (kind, natural) = if el.value().name() == "svg" {
             let tree = svg_tree(&el.html())?;
-            let (vw, vh) = (tree.size().width(), tree.size().height());
+            let (vw, vh) = (tree.size().width() * style::PX, tree.size().height() * style::PX);
             (ImageKind::Svg(Arc::new(tree)), (vw, vh))
         } else {
             let src = attr(&el, "src").unwrap_or("");
@@ -1323,7 +1367,7 @@ impl Builder<'_> {
         // width / height attributes, CSS wins (same as browsers)
         for (i, a) in ["width", "height"].iter().enumerate() {
             if s.size[i] == Len::Auto {
-                if let Some(l) = attr(&el, a).and_then(|v| style::len(v, s.font_size, self.rem)) {
+                if let Some(l) = attr(&el, a).and_then(|v| html_len(v, s.font_size, self.rem)) {
                     s.size[i] = l;
                 }
             }
@@ -1388,6 +1432,25 @@ impl Builder<'_> {
             }
         }
         let nrows = rows.len();
+        // column widths: <col> / <colgroup>, else the widest single-column cell's; the cell then fills its column
+        let mut widths = self.col_widths(el, &s);
+        for (_, cs, _, c, _, colspan) in &mut cells {
+            if cs.size[0] == Len::Auto {
+                continue;
+            }
+            if *colspan == 1 {
+                if widths.len() <= *c {
+                    widths.resize(*c + 1, Len::Auto);
+                }
+                widths[*c] = match (widths[*c], cs.size[0]) {
+                    (Len::Px(a), Len::Px(b)) => Len::Px(a.max(b)),
+                    (Len::Pct(a), Len::Pct(b)) => Len::Pct(a.max(b)),
+                    (Len::Auto, w @ (Len::Px(_) | Len::Pct(_))) => w,
+                    (w, _) => w,
+                };
+            }
+            cs.size[0] = Len::Auto;
+        }
         for (cell, mut cs, r, c, rowspan, colspan) in cells {
             // counters of rows (once per row) and cells, in document order
             if last_row != Some(r) {
@@ -1429,7 +1492,15 @@ impl Builder<'_> {
         }
         let mut ts = to_taffy(&s);
         ts.display = taffy::Display::Grid;
-        ts.grid_template_columns = (0..ncols).map(|_| taffy::GridTemplateComponent::AUTO).collect();
+        ncols = ncols.max(widths.len());
+        // a given width is the column's preferred width: it still grows to fit its content
+        ts.grid_template_columns = (0..ncols)
+            .map(|c| match widths.get(c) {
+                Some(Len::Px(v)) => minmax(MinTrackSizingFunction::auto(), MaxTrackSizingFunction::length(*v)),
+                Some(Len::Pct(v)) => minmax(MinTrackSizingFunction::auto(), MaxTrackSizingFunction::percent(v / 100.0)),
+                _ => taffy::GridTemplateComponent::AUTO,
+            })
+            .collect();
         let spacing = if s.border_collapse { 0.0 } else { s.border_spacing };
         ts.gap = taffy::Size { width: LengthPercentage::length(spacing), height: LengthPercentage::length(spacing) };
         // shrink to content like a browser table, unless a width is given
@@ -1446,6 +1517,41 @@ impl Builder<'_> {
             self.footers.insert(node, footer_cells);
         }
         Some(node)
+    }
+
+    /// Widths of a table's columns from its `<col>` / `<colgroup>` (`width` attribute or CSS), Auto when not given.
+    fn col_widths(&self, el: ElementRef, s: &Style) -> Vec<Len> {
+        let mut out = Vec::new();
+        let width = |e: ElementRef, parent: &Style| {
+            let cs = self.style_of(e, parent);
+            let w = match cs.size[0] {
+                Len::Auto => attr(&e, "width").and_then(|v| html_len(v, cs.font_size, self.rem)).unwrap_or(Len::Auto),
+                w => w,
+            };
+            (w, cs)
+        };
+        let span = |e: ElementRef| attr(&e, "span").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 1000);
+        for child in el.children().filter_map(ElementRef::wrap) {
+            match child.value().name() {
+                "col" => out.extend(std::iter::repeat_n(width(child, s).0, span(child))),
+                "colgroup" => {
+                    let (gw, gs) = width(child, s);
+                    let cols: Vec<ElementRef> = child.children().filter_map(ElementRef::wrap).filter(|c| c.value().name() == "col").collect();
+                    if cols.is_empty() {
+                        out.extend(std::iter::repeat_n(gw, span(child)));
+                    }
+                    for col in cols {
+                        let w = match width(col, &gs).0 {
+                            Len::Auto => gw,
+                            w => w,
+                        };
+                        out.extend(std::iter::repeat_n(w, span(col)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Rows of a table (thead first, tfoot last); returns the number of <thead> and <tfoot> rows.

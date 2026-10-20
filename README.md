@@ -45,7 +45,7 @@ As query parameters or JSON fields:
 | `landscape` | `true` | landscape orientation |
 | `margin` | `40`, `60 40 50 40` | margins in pt (40 by default), CSS order top right bottom left, commas accepted |
 
-`size`, `landscape` and `margin` can also come from the document: `@page { size: A5 landscape; margin: 10mm }`. An option passed with the request wins over `@page`.
+`size`, `landscape` and `margin` can also come from the document: `@page { size: A5 landscape; margin: 10mm }`. `var()` works there too, with the custom properties of `:root`. An option passed with the request wins over `@page`.
 | `font` | `Times-Roman` | default font (`Helvetica` by default) |
 | `fontSize` | `11` | default size (12) |
 | `header` | `<p>Report</p>` | header repeated on every page, vertically centered in the top margin |
@@ -125,7 +125,7 @@ From the command line, `--data` makes the input a template of its folder:
 pdfrs demo/templates/facture.html facture.pdf --data demo/templates/facture.json --locale fr
 ```
 
-[`demo/templates/`](demo/templates) holds a complete invoice: `base.html` (styles, `@page`, numbered footer), `facture.html` (`extends` it; totals computed in the template), `facture.json`, rendered as [`demo/facture.pdf`](demo/facture.pdf) (2 pages, the table header repeated).
+[`demo/templates/`](demo/templates) holds a complete invoice: `base.html` (styles, `@page`, numbered footer), `facture.html` (`extends` it; totals computed in the template), `facture.json`, rendered as [`demo/facture.pdf`](demo/facture.pdf) (2 pages, numbered footer).
 
 ## Deploy on Google Cloud Run
 
@@ -229,7 +229,7 @@ docker run -p 3000:3000 -v ./templates/img:/images:ro -e IMAGES_DIR=/images pdfr
 
 A refused or missing image is not displayed and a warning is written to stderr.
 
-Formats: PNG, JPEG, GIF, WebP and SVG (in `<img>` or inline `<svg>…</svg>` in the HTML). Images are inline, as in a browser: they sit in the line of text (`vertical-align` applies, `text-align: center` centers them); `display: block`, a float or being a flex / grid item takes them out of the line. An image without a size keeps its natural size (1 px = 1 pt), without exceeding the available width; `width` / `height` (attributes or CSS) are honored, keeping the aspect ratio when only one is given. `object-fit` and `border-radius` are supported.
+Formats: PNG, JPEG, GIF, WebP and SVG (in `<img>` or inline `<svg>…</svg>` in the HTML). Images are inline, as in a browser: they sit in the line of text (`vertical-align` applies, `text-align: center` centers them); `display: block`, a float or being a flex / grid item takes them out of the line. An image without a size keeps its natural size (1 px = 0.75 pt), without exceeding the available width; `width` / `height` (attributes or CSS) are honored, keeping the aspect ratio when only one is given. `object-fit` and `border-radius` are supported.
 
 ### Remote resources
 
@@ -244,11 +244,11 @@ A refused or failed download is reported on stderr and rendered as a missing ima
 
 ## Supported CSS
 
-As in pdfjs, **1 px = 1 pt**.
+As in a browser, **1 px = 0.75 pt** (96 px per inch); a unitless length is in pt. `vw` / `vh` / `vmin` / `vmax` are relative to the page area.
 
 - **Layout**: `display` `block` / `inline` / `inline-block` / `flex` / `inline-flex` / `grid` / `inline-grid` / `none` / `contents` / `list-item` / `table…`, margins that collapse like in a browser, `float` / `clear` with **text wrapping around floats** (images, boxes, drop caps: lines beside a float are shortened, then take the full width below it; a line with no room beside it goes below), `position: absolute` (relative to the parent).
 - Full **flexbox**: `flex-direction`, `flex-wrap`, `flex` / `flex-grow` / `flex-shrink` / `flex-basis`, `justify-content`, `align-items`, `align-self`, `align-content`, `gap`, `order`.
-- **Grid**: `grid-template-columns` / `-rows` (`fr`, `repeat()`, `minmax()`, `auto`…), `grid-column` / `grid-row`, `grid-auto-flow`, `gap`, `justify-items`, `place-items`…
+- **Grid**: `grid-template-columns` / `-rows` (`fr`, `repeat()`, `minmax()`, `auto`…), `grid-column` / `grid-row`, `grid-auto-flow`, `gap`, `justify-items`, `place-items`… Every child is a grid / flex item, inline ones (`<span>`, `<a>`) included.
 - **Boxes**: `width` / `height` (+ `min-` / `max-`), `box-sizing`, `margin`, `padding`, `border` (width, `solid` / `dashed` / `dotted`, color per side), `border-radius`, `background-color`, `opacity`, `overflow: hidden`, `aspect-ratio`.
 - **Backgrounds**: colors, gradients and `url()` images, **several layers** (first on top), with `background-size` (`cover`, `contain`, lengths, `%`), `background-position` (keywords, lengths, `%`, `right 10px bottom 5px`), `background-repeat`, `background-origin` and `background-clip` (`border-box`, `padding-box`, `content-box`, and `text`: gradient text, with `-webkit-text-fill-color`), `background-attachment: fixed` (against the page, on every page); all in the `background` shorthand too. The `html` / `body` background covers the whole page, margins included, like a browser's canvas.
 - **Shadows**: `box-shadow` with offsets, blur, spread, color, `inset`, several shadows; a blurred shadow is drawn as a bitmap (~2 px per pt), an unblurred one as a crisp vector shape.
@@ -262,7 +262,7 @@ As in pdfjs, **1 px = 1 pt**.
 - **Text**: `vertical-align` (`sub`, `super`, lengths, `%` of the line height) for text and inline boxes, `font` / `font-family` / `font-size` / `font-weight` / `font-style`, `color`, `text-align` (including `justify`), `line-height`, `text-decoration`, `text-transform`, `letter-spacing`, `word-spacing`, `white-space` (`pre`, `nowrap`…), background of inline elements (`<mark>`, `<span style="background">`).
 - **Units**: `px`, `pt`, `em`, `rem`, `%`, `mm`, `cm`, `in`, `pc`. Colors: names, `#hex`, `rgb()`, `hsl()`…
 - **Pagination**: automatic page breaks between lines of text (never through a line, an image or a table cell that fits on a page), `page-break-before` / `-after: always` (or `break-before: page`), `page-break-inside: avoid`. A table that continues on the next page repeats its `<thead>` at the top, and its `<tfoot>` at the bottom of each page it breaks on.
-- **HTML**: tables (grid with `colspan` / `rowspan`, `border-collapse`, `border-spacing`, `vertical-align`), lists (`disc`, `circle`, `square`, `decimal`, `lower-alpha`, `upper-roman`…, `<ol start>`, `<li value>`), clickable links (`http(s):`, `mailto:`, `tel:`), `<br>`, `<pre>`, `<svg>`, browser default styles (`h1`…`h6`, `b`, `i`, `code`…), `align` / `bgcolor` attributes.
+- **HTML**: tables (grid with `colspan` / `rowspan`, column widths from `<col>` / `<colgroup>` or the cells' `width`, `border-collapse`, `border-spacing`, `vertical-align`), lists (`disc`, `circle`, `square`, `decimal`, `lower-alpha`, `upper-roman`…, `<ol start>`, `<li value>`), clickable links (`http(s):`, `mailto:`, `tel:`), `<br>`, `<pre>`, `<svg>`, browser default styles (`h1`…`h6`, `b`, `i`, `code`…), `align` / `bgcolor` attributes.
 - `<style>` with all CSS selectors (`>`, `+`, `~`, `:first-child`, `:nth-child()`, `[attr]`, `:not()`…), specificity and `!important`.
 
 **Not supported**: a first page wider or narrower than the others (the text would have to change width mid-paragraph; a named page covers a different cover page), floats that do not precede text in the same block (a float followed by blocks narrows them, the text does not flow back under it), `clear` on text after a float, `background-clip: text` with images (gradients only), `@page` named pages for nested elements (top-level ones only).
@@ -282,10 +282,10 @@ As in pdfjs, **1 px = 1 pt**.
 | [`demo/images.html`](demo/images.html) | [`demo/images.pdf`](demo/images.pdf) | images and the image policy |
 | [`demo/report.html`](demo/report.html) | [`demo/report.pdf`](demo/report.pdf) | 3 pages: grid, lists, SVG, `<pre>`, long table with a repeated header, forced page break (rendered with a header and a footer) |
 | [`demo/inline.html`](demo/inline.html) | [`demo/inline.pdf`](demo/inline.pdf) | badges, buttons, cards and images in the line of text, shrink-to-fit, `vertical-align`, `<sub>` / `<sup>` |
-| [`demo/backgrounds.html`](demo/backgrounds.html) | [`demo/backgrounds.pdf`](demo/backgrounds.pdf) | `box-shadow`, `background-image` (tiles, `cover`, `contain`, position), a 3-page table repeating its `<thead>` |
+| [`demo/backgrounds.html`](demo/backgrounds.html) | [`demo/backgrounds.pdf`](demo/backgrounds.pdf) | `box-shadow`, `background-image` (tiles, `cover`, `contain`, position), a 2-page table repeating its `<thead>` |
 | [`demo/floats.html`](demo/floats.html) | [`demo/floats.pdf`](demo/floats.pdf) | text wrapping around a floated image and box, a floated drop cap, justified text |
-| [`demo/print.html`](demo/print.html) + [`print.css`](demo/print.css) | [`demo/print.pdf`](demo/print.pdf) | `<link>` stylesheet, `@page` A5 with margin boxes (`Page 1 sur 4`) and a different first page, counters (`I.`, `1.1`, `counters()`), `::marker`, `::first-letter`, 3 background layers, `inset` shadow, repeated `<thead>` and `<tfoot>` |
-| [`demo/features.html`](demo/features.html) | [`demo/features.pdf`](demo/features.pdf) | gradients, transforms, `calc()`, `var()`, `::before` / `::after`, `@media`, `@page`, right-to-left |
+| [`demo/print.html`](demo/print.html) + [`print.css`](demo/print.css) | [`demo/print.pdf`](demo/print.pdf) | `<link>` stylesheet, `@page` A5 with margin boxes (`Page 1 sur 3`) and a different first page, counters (`I.`, `1.1`, `counters()`), `::marker`, `::first-letter`, 3 background layers, `inset` shadow, repeated `<thead>` and `<tfoot>` |
+| [`demo/features.html`](demo/features.html) | [`demo/features.pdf`](demo/features.pdf) | gradients, transforms, `calc()`, `var()` (in `@page` too), `::before` / `::after`, `@media`, `@page`, right-to-left, `vw` / `vh`, `<span>` grid items, column widths from `<colgroup>` and `<th>` |
 
 ## Performance
 

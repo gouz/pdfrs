@@ -1,5 +1,5 @@
 //! Computed style: cascade result for one element, inheritance, units, shorthands.
-//! 1px = 1pt, like react-pdf (so documents render at the same size as with pdfjs).
+//! Lengths are in pt: 1px = 0.75pt (96px per inch, like a browser); a unitless length is pt, like react-pdf.
 
 use crate::css::Decl;
 use crate::fonts;
@@ -7,6 +7,19 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use taffy::prelude::TaffyZero;
 use taffy::{AlignContent, AlignItems, Dimension, FlexDirection, FlexWrap, LengthPercentage, LengthPercentageAuto};
+
+/// pt per CSS px
+pub const PX: f32 = 0.75;
+
+thread_local! {
+    /// The page area (pt) that `vw` / `vh` / `vmin` / `vmax` refer to.
+    static VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((515.28, 761.89)) };
+}
+
+/// Set the page area of the document being laid out (for viewport units).
+pub fn set_viewport(width: f32, height: f32) {
+    VIEWPORT.with(|v| v.set((width, height)));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum Len {
@@ -483,7 +496,8 @@ pub fn len(v: &str, em: f32, rem: f32) -> Option<Len> {
     let n: f32 = num.parse().ok()?;
     let px = match unit.trim() {
         "" if n == 0.0 => 0.0,
-        "px" | "pt" | "" => n, // unitless non-zero: lenient, like react-pdf
+        "px" => n * PX,
+        "pt" | "" => n, // unitless non-zero: lenient, like react-pdf
         "%" => return Some(Len::Pct(n)),
         "em" => n * em,
         "rem" => n * rem,
@@ -493,6 +507,16 @@ pub fn len(v: &str, em: f32, rem: f32) -> Option<Len> {
         "mm" => n * 72.0 / 25.4,
         "q" => n * 72.0 / 101.6,
         "ex" | "ch" => n * em * 0.5,
+        "vw" | "vh" | "vmin" | "vmax" => {
+            let (w, h) = VIEWPORT.with(|v| v.get());
+            n / 100.0
+                * match unit.trim() {
+                    "vw" => w,
+                    "vh" => h,
+                    "vmin" => w.min(h),
+                    _ => w.max(h),
+                }
+        }
         _ => return None,
     };
     Some(Len::Px(px))
@@ -1010,7 +1034,7 @@ pub fn transform_matrix(v: &str, w: f32, h: f32, em: f32) -> Option<[f32; 6]> {
             "skew" => [1.0, a(1).unwrap_or(0.0).tan(), a(0)?.tan(), 1.0, 0.0, 0.0],
             "skewx" => [1.0, 0.0, a(0)?.tan(), 1.0, 0.0, 0.0],
             "skewy" => [1.0, a(0)?.tan(), 0.0, 1.0, 0.0, 0.0],
-            "matrix" => [n(0)?, n(1)?, n(2)?, n(3)?, n(4)?, n(5)?],
+            "matrix" => [n(0)?, n(1)?, n(2)?, n(3)?, n(4)? * PX, n(5)? * PX],
             _ => return None,
         };
         m = mul(m, t);
@@ -1093,9 +1117,9 @@ pub fn content(v: &str, attr: impl Fn(&str) -> Option<String>, counter: impl Fn(
 
 fn border_width(v: &str, em: f32, rem: f32) -> Option<f32> {
     match v.to_ascii_lowercase().as_str() {
-        "thin" => Some(1.0),
-        "medium" => Some(3.0),
-        "thick" => Some(5.0),
+        "thin" => Some(PX),
+        "medium" => Some(3.0 * PX),
+        "thick" => Some(5.0 * PX),
         v => len(v, em, rem)?.px(),
     }
 }
@@ -1660,13 +1684,13 @@ fn side(prop: &str) -> usize {
     ["top", "right", "bottom", "left"].iter().position(|s| prop.contains(s)).unwrap_or(0)
 }
 
-/// rewrite every em/rem/pt/mm... length of a value to px, for taffy's parser (it only takes px)
+/// rewrite every px/em/rem/mm... length of a value to taffy's unit (pt, which its parser calls px)
 fn px_units(v: &str, em: f32, rem: f32) -> String {
     let mut out = String::new();
     for tok in v.split_inclusive(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',') {
         let (word, sep) = tok.split_at(tok.trim_end_matches(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',').len());
         match len(word, em, rem) {
-            Some(Len::Px(px)) if word.ends_with(|c: char| c.is_ascii_alphabetic()) && !word.ends_with("px") && !word.ends_with("fr") => out.push_str(&format!("{px}px")),
+            Some(Len::Px(px)) if word.ends_with(|c: char| c.is_ascii_alphabetic()) && !word.ends_with("fr") => out.push_str(&format!("{px}px")),
             _ => out.push_str(word),
         }
         out.push_str(sep);
@@ -1688,7 +1712,14 @@ mod tests {
 
     #[test]
     fn lengths() {
-        assert_eq!(len("10px", 12.0, 12.0), Some(Len::Px(10.0)));
+        assert_eq!(len("10pt", 12.0, 12.0), Some(Len::Px(10.0)));
+        assert_eq!(len("16px", 12.0, 12.0), Some(Len::Px(12.0))); // 1px = 0.75pt
+        assert_eq!(len("96px", 12.0, 12.0), len("1in", 12.0, 12.0));
+        set_viewport(400.0, 600.0);
+        assert_eq!(len("50vw", 12.0, 12.0), Some(Len::Px(200.0)));
+        assert_eq!(len("10vh", 12.0, 12.0), Some(Len::Px(60.0)));
+        assert_eq!(len("10vmin", 12.0, 12.0), Some(Len::Px(40.0)));
+        assert_eq!(len("calc(100vh - 100pt)", 12.0, 12.0), Some(Len::Px(500.0)));
         assert_eq!(len("2em", 12.0, 12.0), Some(Len::Px(24.0)));
         assert_eq!(len("50%", 12.0, 12.0), Some(Len::Pct(50.0)));
         assert_eq!(len("1in", 12.0, 12.0), Some(Len::Px(72.0)));
@@ -1698,10 +1729,10 @@ mod tests {
 
     #[test]
     fn shorthands() {
-        let s = computed("margin: 1px 2px; padding: 1em; border: medium dashed #f00; border-left: none; flex: 1");
+        let s = computed("margin: 1pt 2pt; padding: 1em; border: medium dashed #f00; border-left: none; flex: 1");
         assert_eq!(s.margin, [Len::Px(1.0), Len::Px(2.0), Len::Px(1.0), Len::Px(2.0)]);
         assert_eq!(s.padding[3], Len::Px(12.0));
-        assert_eq!(s.border_width[0], 3.0);
+        assert_eq!(s.border_width[0], 3.0 * PX); // medium = 3px
         assert_eq!(s.border_style[1], BorderStyle::Dashed);
         assert_eq!(s.border_style[3], BorderStyle::None);
         assert_eq!(s.border_color[0], Some(Rgba(255, 0, 0, 255)));
@@ -1711,9 +1742,9 @@ mod tests {
     #[test]
     fn font_size_before_em() {
         // em lengths use the element's own font-size, whatever the declaration order
-        let s = computed("padding: 1em; font-size: 20px");
+        let s = computed("padding: 1em; font-size: 20pt");
         assert_eq!(s.padding[0], Len::Px(20.0));
-        let s = computed("font: italic bold 10px/2 serif");
+        let s = computed("font: italic bold 10pt/2 serif");
         assert!(s.italic && s.font_weight == 700.0 && s.font_size == 10.0 && s.line_height == LineHeight::Factor(2.0));
     }
 
@@ -1729,7 +1760,7 @@ mod tests {
     fn custom_properties() {
         crate::fonts::init_for_tests();
         let root = Style::root("Helvetica", 12.0);
-        let decls = parse_declarations("--gap: 4px; --pad: calc(var(--gap) * 2); padding: var(--pad); margin: var(--nope, 3px); width: var(--nope)");
+        let decls = parse_declarations("--gap: 4pt; --pad: calc(var(--gap) * 2); padding: var(--pad); margin: var(--nope, 3pt); width: var(--nope)");
         let refs: Vec<&Decl> = decls.iter().collect();
         let s = Style::compute(&root, &refs, 12.0);
         assert_eq!(s.padding[0], Len::Px(8.0));
@@ -1737,7 +1768,7 @@ mod tests {
         assert_eq!(s.size[0], Len::Auto); // undefined, no fallback: declaration dropped
         // inherited by children
         let child = Style::compute(&s, &[], 12.0);
-        assert_eq!(child.vars.as_ref().unwrap().get("--gap").map(String::as_str), Some("4px"));
+        assert_eq!(child.vars.as_ref().unwrap().get("--gap").map(String::as_str), Some("4pt"));
         // a cycle does not hang
         let decls = parse_declarations("--a: var(--b); --b: var(--a); width: var(--a)");
         let refs: Vec<&Decl> = decls.iter().collect();
@@ -1747,31 +1778,31 @@ mod tests {
     #[test]
     fn calc_and_friends() {
         let l = |v| len(v, 10.0, 12.0);
-        assert_eq!(l("calc(10px + 2em)"), Some(Len::Px(30.0)));
+        assert_eq!(l("calc(10pt + 2em)"), Some(Len::Px(30.0)));
         assert_eq!(l("calc(50% / 2)"), Some(Len::Pct(25.0)));
-        assert_eq!(l("calc(100% - 20px)"), Some(Len::Calc(-20.0, 100.0)));
-        assert_eq!(l("calc((1rem + 3px) * 2)"), Some(Len::Px(30.0)));
-        assert_eq!(l("calc(2 * -5px)"), Some(Len::Px(-10.0)));
-        assert_eq!(l("calc(10px * 2px)"), None);
-        assert_eq!(l("min(10px, 2em, 50px)"), Some(Len::Px(10.0)));
-        assert_eq!(l("clamp(5px, 100px, 30px)"), Some(Len::Px(30.0)));
+        assert_eq!(l("calc(100% - 20pt)"), Some(Len::Calc(-20.0, 100.0)));
+        assert_eq!(l("calc((1rem + 3pt) * 2)"), Some(Len::Px(30.0)));
+        assert_eq!(l("calc(2 * -5pt)"), Some(Len::Px(-10.0)));
+        assert_eq!(l("calc(10pt * 2pt)"), None);
+        assert_eq!(l("min(10pt, 2em, 50pt)"), Some(Len::Px(10.0)));
+        assert_eq!(l("clamp(5pt, 100pt, 30pt)"), Some(Len::Px(30.0)));
         assert_eq!(resolve(Len::Calc(-20.0, 100.0), 200.0), 180.0);
     }
 
     #[test]
     fn border_radius_pct_and_calc() {
         // percentage radius
-        let s = computed("width: 60px; height: 60px; border: 3px solid black; border-radius: 50%");
+        let s = computed("width: 60pt; height: 60pt; border: 3pt solid black; border-radius: 50%");
         assert_eq!(s.radius, [Len::Pct(50.0); 4]);
         assert_eq!(resolve_radius(s.radius, 60.0, 60.0), [30.0; 4]);
 
         // calc with division in border-radius — must not be split on the `/`
-        let s = computed("border-radius: calc(80px / 2)");
+        let s = computed("border-radius: calc(80pt / 2)");
         assert_eq!(s.radius, [Len::Px(40.0); 4]);
         assert_eq!(resolve_radius(s.radius, 100.0, 100.0), [40.0; 4]);
 
-        // mixed: `border-radius: 10px 50%`
-        let s = computed("border-radius: 10px 50%");
+        // mixed: `border-radius: 10pt 50%`
+        let s = computed("border-radius: 10pt 50%");
         assert_eq!(s.radius, [Len::Px(10.0), Len::Pct(50.0), Len::Px(10.0), Len::Pct(50.0)]);
         let r = resolve_radius(s.radius, 80.0, 60.0);
         assert_eq!(r, [10.0, 30.0, 10.0, 30.0]); // 50% of min(80,60) = 30
@@ -1799,7 +1830,7 @@ mod tests {
 
     #[test]
     fn transforms() {
-        let m = transform_matrix("translate(10px, 50%) scale(2)", 100.0, 40.0, 12.0).unwrap();
+        let m = transform_matrix("translate(10pt, 50%) scale(2)", 100.0, 40.0, 12.0).unwrap();
         assert_eq!(m, [2.0, 0.0, 0.0, 2.0, 10.0, 20.0]);
         let r = transform_matrix("rotate(90deg)", 10.0, 10.0, 12.0).unwrap();
         assert!((r[0]).abs() < 1e-6 && (r[1] - 1.0).abs() < 1e-6 && (r[2] + 1.0).abs() < 1e-6);
@@ -1811,7 +1842,7 @@ mod tests {
 
     #[test]
     fn counters_and_vertical_align() {
-        let s = computed("counter-reset: chapter section 3; counter-increment: section -1; vertical-align: 3px");
+        let s = computed("counter-reset: chapter section 3; counter-increment: section -1; vertical-align: 3pt");
         assert_eq!(s.counter_reset.as_deref(), Some(&vec![("chapter".to_string(), 0), ("section".to_string(), 3)]));
         assert_eq!(s.counter_increment.as_deref(), Some(&vec![("section".to_string(), -1)]));
         assert_eq!(s.vertical_align, VAlign::Length(3.0));
@@ -1839,7 +1870,7 @@ mod tests {
 
     #[test]
     fn backgrounds_and_shadows() {
-        let s = computed("background: #fff url('img/a.png') no-repeat right 10px top / 50% auto");
+        let s = computed("background: #fff url('img/a.png') no-repeat right 10pt top / 50% auto");
         let bg = s.bg.clone().unwrap();
         assert_eq!(bg.images, vec![BgSource::Url("img/a.png".into())]);
         assert_eq!(s.background, Some(Rgba(255, 255, 255, 255)));
@@ -1863,12 +1894,12 @@ mod tests {
         let s = computed("background-image: url(a.png), url(b.png), url(c.png); background-repeat: no-repeat, repeat");
         let bg = s.bg.clone().unwrap();
         assert_eq!(Background::nth(&bg.repeats, 2, (true, true)), (false, false));
-        let s = computed("color: red; box-shadow: 0 2px 4px rgba(0, 0, 0, .5), inset 1px 1px blue, 3px 3px 0 2px");
+        let s = computed("color: red; box-shadow: 0 2pt 4pt rgba(0, 0, 0, .5), inset 1pt 1pt blue, 3pt 3pt 0 2pt");
         let sh = s.shadows.unwrap();
         assert_eq!(sh[0], Shadow { dx: 0.0, dy: 2.0, blur: 4.0, spread: 0.0, color: Rgba(0, 0, 0, 128), inset: false });
         assert!(sh[1].inset && sh[1].color == Rgba(0, 0, 255, 255));
         assert_eq!((sh[2].spread, sh[2].color), (2.0, Rgba(255, 0, 0, 255)));
-        assert!(computed("box-shadow: 1px").shadows.is_none());
+        assert!(computed("box-shadow: 1pt").shadows.is_none());
     }
 
     #[test]
