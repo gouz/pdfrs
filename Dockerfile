@@ -1,13 +1,21 @@
 # Static musl binary + a few fonts in a distroless image (CA certs, tzdata, nonroot user, no shell, no libc).
-FROM rust:alpine AS build
-RUN apk add --no-cache musl-dev font-liberation font-dejavu
+FROM rust:alpine AS chef
+RUN apk add --no-cache musl-dev font-liberation font-dejavu && cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src
-# dependencies first, cached as long as Cargo.toml / Cargo.lock don't change
+
+# the dependencies' recipe: Cargo.toml / Cargo.lock without our own version, so a version bump keeps the cache
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
- && cargo build --release --locked && rm -rf src
 COPY src src
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /src/recipe.json recipe.json
+# dependencies first, cached as long as the recipe does not change
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY src src
+RUN cargo build --release --locked
 # Liberation: metric-compatible Helvetica / Times / Courier; DejaVu Sans: fallback for missing glyphs
 RUN mkdir -p /out/fonts \
  && cp /usr/share/fonts/liberation/*.ttf /out/fonts/ \

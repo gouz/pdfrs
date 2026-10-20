@@ -15,7 +15,7 @@ docker run -p 3000:3000 ghcr.io/gouz/pdfrs:main
 docker build -t pdfrs . && docker run -p 3000:3000 pdfrs
 ```
 
-The image (amd64 and arm64) is published by CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `:main` and `:sha-xxxxxxx` on every push to `main`, `:1.2.3`, `:1.2` and `:latest` for a `v1.2.3` tag. Pull requests run the tests and build the image without publishing it.
+The image (amd64 and arm64) is published by CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `:main` and `:sha-xxxxxxx` on every push to `main`. A `v1.2.3` tag is not built again: the image `main` built for that commit gets `:1.2.3`, `:1.2` and `:latest` (push the commit to `main` before or with its tag). Pull requests run the tests and build the image without publishing it.
 
 ```bash
 # raw HTML in the body, options in the query string
